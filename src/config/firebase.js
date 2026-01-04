@@ -2,24 +2,52 @@ const admin = require("firebase-admin");
 const path = require("path");
 const fs = require("fs");
 
-const serviceAccountPath = path.join(__dirname, "../../serviceAccountKey.json");
-
 /**
  * FIREBASE ADMIN SDK - PRODUCTION CONFIGURATION
  * Secure server-side Firebase access
+ * 
+ * Supports two methods:
+ * 1. Environment variable FIREBASE_SERVICE_ACCOUNT (recommended for production)
+ * 2. Fallback to local serviceAccountKey.json (useful for local development)
  */
 
-if (!fs.existsSync(serviceAccountPath)) {
-    console.error("❌ ERROR: serviceAccountKey.json not found!");
-    console.error("Place your Firebase service account key in the project root");
-    process.exit(1);
+let serviceAccount;
+
+// Priority 1: Use environment variable (secure for production - Vercel, Render, Heroku, etc.)
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+    try {
+        serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+        console.log("✅ Firebase service account loaded from FIREBASE_SERVICE_ACCOUNT environment variable");
+    } catch (error) {
+        console.error("❌ ERROR: Invalid FIREBASE_SERVICE_ACCOUNT environment variable (must be valid JSON string)");
+        console.error("   Check for missing quotes, escaped newlines, or parsing issues.");
+        process.exit(1);
+    }
+} else {
+    // Priority 2: Fallback to local JSON file
+    const serviceAccountPath = path.join(__dirname, "../../serviceAccountKey.json");
+
+    if (!fs.existsSync(serviceAccountPath)) {
+        console.error("❌ ERROR: serviceAccountKey.json not found at:", serviceAccountPath);
+        console.error("   Either:");
+        console.error("   • Place your service account key file there (for local dev), OR");
+        console.error("   • Set the FIREBASE_SERVICE_ACCOUNT environment variable (recommended for production)");
+        process.exit(1);
+    }
+
+    try {
+        serviceAccount = require(serviceAccountPath);
+        console.log("✅ Firebase service account loaded from local serviceAccountKey.json");
+    } catch (error) {
+        console.error("❌ ERROR: Failed to load or parse serviceAccountKey.json");
+        process.exit(1);
+    }
 }
 
-const serviceAccount = require(serviceAccountPath);
-
 // Validate required fields
-if (!serviceAccount.project_id || !serviceAccount.private_key) {
-    console.error("❌ ERROR: Invalid serviceAccountKey.json");
+if (!serviceAccount.project_id || !serviceAccount.private_key || !serviceAccount.client_email) {
+    console.error("❌ ERROR: Invalid service account credentials - missing required fields");
+    console.error("   Required: project_id, private_key, client_email");
     process.exit(1);
 }
 
@@ -30,6 +58,7 @@ if (!admin.apps.length) {
         databaseURL: `https://${serviceAccount.project_id}.firebaseio.com`,
         storageBucket: `${serviceAccount.project_id}.appspot.com`
     });
+    console.log(`✅ Firebase Admin initialized for project: ${serviceAccount.project_id}`);
 }
 
 const db = admin.firestore();
