@@ -38,10 +38,14 @@ app.use(helmet({
 app.use(cors({
   origin: process.env.NODE_ENV === 'production' 
     ? ['https://elitehubng.com', 'https://www.elitehubng.com']
-    : '*',
+    : [
+        'http://localhost:8081', 
+        'http://192.168.100.142:8081', // Your machine's Local IP
+        '*' 
+      ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-cache']
 }));
 
 // Compression for responses
@@ -159,7 +163,8 @@ async function initializeApp() {
     const PORT = process.env.PORT || 3000;
     app.listen(PORT, () => {
       console.log(`🚀 EliteHub API running on port ${PORT}`);
-      console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+      console.log(`📡 Local Network Access: http://192.168.100.142:${PORT}`);
+  console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
     });
   } catch (error) {
     console.error('❌ Failed to initialize app:', error);
