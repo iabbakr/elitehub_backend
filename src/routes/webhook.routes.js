@@ -1,3 +1,4 @@
+// src/routes/webhook.routes.js - FIXED PRODUCTION VERSION
 const express = require('express');
 const router = express.Router();
 const paystackService = require('../services/paystack.service');
@@ -6,16 +7,26 @@ const { client } = require('../config/redis');
 const { sendDepositAlert } = require('../services/email.service');
 
 /**
- * PAYSTACK WEBHOOK HANDLER
- * Production-grade with signature verification and idempotency
+ * CRITICAL FIX: Paystack webhook signature verification
+ * The signature must be verified against the RAW body buffer
  */
-
 router.post('/paystack', async (req, res) => {
     try {
-        // 1. Verify webhook signature
+        // 1. Get signature from header
         const signature = req.headers['x-paystack-signature'];
         
-        if (!paystackService.verifyWebhookSignature(req.body, signature)) {
+        if (!signature) {
+            console.error('❌ No webhook signature provided');
+            return res.status(401).json({
+                success: false,
+                message: 'No signature'
+            });
+        }
+
+        // 2. Verify signature using RAW body (req.rawBody set in server.js)
+        const isValid = paystackService.verifyWebhookSignature(req, signature);
+        
+        if (!isValid) {
             console.error('❌ Invalid webhook signature');
             return res.status(401).json({
                 success: false,
@@ -24,9 +35,9 @@ router.post('/paystack', async (req, res) => {
         }
 
         const event = req.body;
-        const eventId = event.id || event.data?.id;
+        const eventId = event.id || event.data?.id || `evt_${Date.now()}`;
 
-        // 2. Check if event already processed (Redis idempotency)
+        // 3. Idempotency check
         const lockKey = `webhook:lock:${eventId}`;
         const isProcessed = await client.get(lockKey);
 
@@ -38,10 +49,15 @@ router.post('/paystack', async (req, res) => {
             });
         }
 
-        // 3. Set processing lock (24 hours)
+        // 4. Set processing lock (24 hours)
         await client.setEx(lockKey, 86400, 'processing');
 
-        // 4. Handle different event types
+        console.log(`📨 Webhook received: ${event.event}`, {
+            eventId,
+            reference: event.data?.reference
+        });
+
+        // 5. Handle different event types
         switch (event.event) {
             case 'charge.success':
                 await handleChargeSuccess(event);
@@ -52,25 +68,22 @@ router.post('/paystack', async (req, res) => {
                 break;
             
             case 'transfer.failed':
+            case 'transfer.reversed':
                 await handleTransferFailed(event);
                 break;
             
-            case 'transfer.reversed':
-                await handleTransferReversed(event);
-                break;
-            
             default:
-                console.log('Unhandled event type:', event.event);
+                console.log('ℹ️ Unhandled event type:', event.event);
         }
 
-        // 5. Mark as completed
+        // 6. Mark as completed
         await client.setEx(lockKey, 86400, 'completed');
 
-        // Always respond quickly to Paystack
+        // Always respond 200 to prevent Paystack retries
         res.status(200).json({ success: true });
 
     } catch (error) {
-        console.error('Webhook processing error:', error);
+        console.error('❌ Webhook processing error:', error);
         
         // Still return 200 to prevent Paystack retries
         res.status(200).json({
@@ -81,7 +94,7 @@ router.post('/paystack', async (req, res) => {
 });
 
 /**
- * Handle successful payment
+ * FIXED: Handle successful payment
  */
 async function handleChargeSuccess(event) {
     try {
@@ -90,27 +103,33 @@ async function handleChargeSuccess(event) {
         
         console.log(`✅ Payment Success: ₦${amountInNaira} from ${customer.email}`);
 
-        // Credit user wallet
+        // Extract userId from metadata
         const userId = metadata?.userId || metadata?.user_id;
         
         if (!userId) {
-            console.error('No userId in payment metadata');
+            console.error('❌ No userId in payment metadata');
             return;
         }
 
-        await walletService.creditWallet(
+        // Credit wallet using improved service
+        const result = await walletService.creditWallet(
             userId,
             amountInNaira,
             reference,
             {
                 customerEmail: customer.email,
-                customerName: customer.first_name + ' ' + customer.last_name,
+                customerName: `${customer.first_name} ${customer.last_name}`,
                 paymentMethod: 'paystack',
-                originalAmount: amountInNaira
+                type: 'deposit'
             }
         );
 
-        // Send email notification
+        if (result.alreadyProcessed) {
+            console.log('⚠️ Payment already credited:', reference);
+            return;
+        }
+
+        // Send email notification (non-blocking)
         try {
             await sendDepositAlert(
                 customer.email,
@@ -118,13 +137,13 @@ async function handleChargeSuccess(event) {
                 amountInNaira
             );
         } catch (emailError) {
-            console.error('Email notification failed:', emailError);
+            console.error('📧 Email notification failed:', emailError);
             // Don't fail the webhook if email fails
         }
 
-        console.log(`💰 Wallet credited: ${userId} - ₦${amountInNaira}`);
+        console.log(`💰 Wallet credited successfully: ${userId} - ₦${amountInNaira}`);
     } catch (error) {
-        console.error('Handle charge success error:', error);
+        console.error('❌ Handle charge success error:', error);
         throw error;
     }
 }
@@ -134,12 +153,11 @@ async function handleChargeSuccess(event) {
  */
 async function handleTransferSuccess(event) {
     try {
-        const { amount, recipient, reference, reason } = event.data;
+        const { amount, recipient, reference } = event.data;
         const amountInNaira = amount / 100;
         
-        console.log(`✅ Transfer Success: ₦${amountInNaira} to ${recipient.details.account_number}`);
+        console.log(`✅ Transfer Success: ₦${amountInNaira} to ${recipient.details?.account_number}`);
 
-        // Update transaction status in database
         const { db } = require('../config/firebase');
         const txnQuery = await db.collection('transactions')
             .where('reference', '==', reference)
@@ -153,24 +171,24 @@ async function handleTransferSuccess(event) {
                 completedAt: Date.now(),
                 gatewayResponse: 'Transfer successful'
             });
+            
+            console.log('📝 Transaction updated to success:', reference);
         }
-
     } catch (error) {
-        console.error('Handle transfer success error:', error);
+        console.error('❌ Handle transfer success error:', error);
     }
 }
 
 /**
- * Handle failed transfer
+ * Handle failed/reversed transfer
  */
 async function handleTransferFailed(event) {
     try {
-        const { amount, recipient, reference } = event.data;
+        const { amount, reference } = event.data;
         const amountInNaira = amount / 100;
         
         console.log(`❌ Transfer Failed: ₦${amountInNaira} - ${reference}`);
 
-        // Get transaction and refund user
         const { db } = require('../config/firebase');
         const txnQuery = await db.collection('transactions')
             .where('reference', '==', reference)
@@ -193,6 +211,8 @@ async function handleTransferFailed(event) {
                         reason: 'Transfer failed'
                     }
                 );
+                
+                console.log(`💰 Refunded: ${txnData.userId} - ₦${amountInNaira}`);
             }
 
             // Update transaction
@@ -202,32 +222,13 @@ async function handleTransferFailed(event) {
                 refunded: true
             });
         }
-
     } catch (error) {
-        console.error('Handle transfer failed error:', error);
+        console.error('❌ Handle transfer failed error:', error);
     }
 }
 
 /**
- * Handle reversed transfer
- */
-async function handleTransferReversed(event) {
-    try {
-        const { amount, reference } = event.data;
-        const amountInNaira = amount / 100;
-        
-        console.log(`🔄 Transfer Reversed: ₦${amountInNaira} - ${reference}`);
-
-        // Similar to failed transfer - refund user
-        await handleTransferFailed(event);
-
-    } catch (error) {
-        console.error('Handle transfer reversed error:', error);
-    }
-}
-
-/**
- * Test webhook endpoint (for development)
+ * Test endpoint
  */
 router.get('/test', (req, res) => {
     res.json({
