@@ -51,6 +51,16 @@ app.use(cors({
 // Compression for responses
 app.use(compression());
 
+// In server.js (Place this ABOVE your global app.use(express.json()))
+app.use(express.json({
+  verify: (req, res, buf) => {
+    // Only capture rawBody for paystack webhook path to save memory
+    if (req.originalUrl.includes('webhooks/paystack')) {
+      req.rawBody = buf;
+    }
+  }
+}));
+
 // Body parsers
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));

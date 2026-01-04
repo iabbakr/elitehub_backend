@@ -120,14 +120,17 @@ class PaystackService {
     /**
      * Verify webhook signature
      */
-    verifyWebhookSignature(payload, signature) {
-        const hash = crypto
-            .createHmac('sha512', PAYSTACK_SECRET_KEY)
-            .update(JSON.stringify(payload))
-            .digest('hex');
+    // src/services/paystack.service.js
+verifyWebhookSignature(req, signature) {
+    // Paystack sends the signature in the header: x-paystack-signature
+    // We compare it against a hash of the raw request body
+    const hash = crypto
+        .createHmac('sha512', PAYSTACK_SECRET_KEY)
+        .update(req.rawBody) // Use the raw buffer captured in server.js
+        .digest('hex');
 
-        return hash === signature;
-    }
+    return hash === signature;
+}
 
     /**
      * Create transfer recipient (for withdrawals)
