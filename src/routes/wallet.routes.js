@@ -123,6 +123,60 @@ router.get(
 );
 
 /**
+ * POST /api/v1/wallet/debit
+ * Generic debit for subscriptions, fees, etc.
+ */
+router.post(
+    '/debit',
+    authenticate, // Use your existing auth middleware
+    async (req, res) => {
+        try {
+            const { userId, amount, description, category, metadata } = req.body;
+
+            // 1. Security check: Ensure user is only debiting their own wallet
+            if (req.userId !== userId && req.userRole !== 'admin') {
+                return res.status(403).json({
+                    success: false,
+                    message: 'Unauthorized wallet access'
+                });
+            }
+
+            // 2. Basic validation
+            if (!amount || amount <= 0) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Valid amount is required'
+                });
+            }
+
+            // 3. Call your existing WalletService.debitWallet logic
+            const result = await walletService.debitWallet(
+                userId,
+                amount,
+                description || `${category} payment`,
+                {
+                    ...metadata,
+                    category: category || 'general_debit'
+                }
+            );
+
+            res.json({
+                success: true,
+                message: 'Wallet debited successfully',
+                transaction: result.transaction
+            });
+
+        } catch (error) {
+            console.error('Wallet debit route error:', error);
+            res.status(error.message === 'Insufficient balance' ? 400 : 500).json({
+                success: false,
+                message: error.message || 'Failed to process debit'
+            });
+        }
+    }
+);
+
+/**
  * POST /api/v1/wallet/initialize-deposit
  * Initialize payment for wallet deposit
  */
