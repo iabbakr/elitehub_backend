@@ -1,8 +1,40 @@
-// src/services/wallet.service.js - FIXED VERSION
+// src/services/wallet.service.js - FIXED WITH AUTO WALLET CREATION
 const { db, admin } = require('../config/firebase');
 const { client } = require('../config/redis');
 
 class WalletService {
+    /**
+     * ✅ NEW: Ensure wallet exists for user (Critical Fix)
+     */
+    async ensureWalletExists(userId) {
+        try {
+            const walletRef = db.collection('wallets').doc(userId);
+            const walletDoc = await walletRef.get();
+
+            if (!walletDoc.exists) {
+                console.log(`🆕 Creating new wallet for user: ${userId}`);
+                
+                const newWallet = {
+                    userId,
+                    balance: 0,
+                    pendingBalance: 0,
+                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                };
+
+                await walletRef.set(newWallet);
+                console.log(`✅ Wallet created successfully for: ${userId}`);
+                
+                return newWallet;
+            }
+
+            return walletDoc.data();
+        } catch (error) {
+            console.error('❌ Ensure wallet exists error:', error);
+            throw new Error('Failed to ensure wallet exists');
+        }
+    }
+
     /**
      * Credit wallet with idempotency and sub-collection support
      */
@@ -10,7 +42,7 @@ class WalletService {
         const lockKey = `payment:${reference}`;
 
         try {
-            // 1. Check if already processed (Redis idempotency)
+            // Check if already processed
             const isProcessed = await client.get(lockKey);
             if (isProcessed) {
                 console.log('⚠️ Payment already processed:', reference);
@@ -21,22 +53,12 @@ class WalletService {
                 };
             }
 
-            // 2. Get wallet reference
+            // ✅ Ensure wallet exists before crediting
+            await this.ensureWalletExists(userId);
+
             const walletRef = db.collection('wallets').doc(userId);
-            const walletDoc = await walletRef.get();
 
-            // Create wallet if doesn't exist
-            if (!walletDoc.exists) {
-                await walletRef.set({
-                    userId,
-                    balance: 0,
-                    pendingBalance: 0,
-                    createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-            }
-
-            // 3. Create transaction object
+            // Create transaction object
             const transaction = {
                 id: reference,
                 type: 'credit',
@@ -53,17 +75,17 @@ class WalletService {
                 }
             };
 
-            // 4. Update wallet balance atomically
+            // Update wallet balance atomically
             await walletRef.update({
                 balance: admin.firestore.FieldValue.increment(amount),
                 updatedAt: admin.firestore.FieldValue.serverTimestamp()
             });
 
-            // 5. Add transaction to SUB-COLLECTION (scalable approach)
+            // Add transaction to sub-collection
             const txnRef = walletRef.collection('transactions').doc(reference);
             await txnRef.set(transaction);
 
-            // 6. Mark as processed in Redis (24 hours)
+            // Mark as processed in Redis (24 hours)
             await client.setEx(lockKey, 86400, JSON.stringify({
                 userId,
                 amount,
@@ -71,7 +93,7 @@ class WalletService {
                 processedAt: Date.now()
             }));
 
-            // 7. Invalidate wallet cache
+            // Invalidate wallet cache
             await this.invalidateWalletCache(userId);
 
             console.log(`✅ Wallet credited: ${userId} +₦${amount}`);
@@ -101,6 +123,9 @@ class WalletService {
             if (isProcessed) {
                 return { success: true, alreadyProcessed: true };
             }
+
+            // ✅ Ensure wallet exists
+            await this.ensureWalletExists(userId);
 
             const walletRef = db.collection('wallets').doc(userId);
             const walletDoc = await walletRef.get();
@@ -165,40 +190,28 @@ class WalletService {
     }
 
     /**
-     * Get wallet with caching
+     * Get wallet with caching and auto-creation
      */
     async getWallet(userId) {
         const cacheKey = `wallet:${userId}`;
 
         try {
-            // 1. Try Redis cache first
+            // Try Redis cache first
             const cached = await client.get(cacheKey);
             if (cached) {
                 return JSON.parse(cached);
             }
 
-            // 2. Get from Firestore
+            // ✅ Ensure wallet exists
+            await this.ensureWalletExists(userId);
+
+            // Get from Firestore
             const walletRef = db.collection('wallets').doc(userId);
             const walletDoc = await walletRef.get();
 
-            if (!walletDoc.exists) {
-                // Create new wallet
-                const newWallet = {
-                    userId,
-                    balance: 0,
-                    pendingBalance: 0,
-                    createdAt: Date.now(),
-                    updatedAt: Date.now(),
-                    transactions: []
-                };
-                
-                await walletRef.set(newWallet);
-                return newWallet;
-            }
-
             const wallet = walletDoc.data();
 
-            // 3. Get recent transactions from sub-collection
+            // Get recent transactions from sub-collection
             const txnsSnapshot = await walletRef
                 .collection('transactions')
                 .orderBy('timestamp', 'desc')
@@ -215,7 +228,7 @@ class WalletService {
                 transactions
             };
 
-            // 4. Cache for 5 minutes
+            // Cache for 5 minutes
             await client.setEx(cacheKey, 300, JSON.stringify(walletData));
 
             return walletData;

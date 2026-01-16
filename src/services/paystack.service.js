@@ -3,8 +3,7 @@ const crypto = require('crypto');
 const { db } = require('../config/firebase');
 
 /**
- * PRODUCTION-GRADE PAYSTACK INTEGRATION
- * Implements secure payment processing with webhook verification
+ * PRODUCTION-GRADE PAYSTACK INTEGRATION - FIXED
  */
 
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
@@ -24,7 +23,7 @@ class PaystackService {
                 `${PAYSTACK_BASE_URL}/transaction/initialize`,
                 {
                     email,
-                    amount: amount * 100, // Convert to kobo
+                    amount: amount * 100,
                     currency: 'NGN',
                     callback_url: metadata.callback_url || 'elitehubng://payment-callback',
                     metadata: {
@@ -52,7 +51,6 @@ class PaystackService {
 
             const { authorization_url, access_code, reference } = response.data.data;
 
-            // Store pending transaction
             await db.collection('transactions').doc(reference).set({
                 reference,
                 email,
@@ -95,13 +93,12 @@ class PaystackService {
 
             const { data } = response.data;
 
-            // Update transaction in database
             await db.collection('transactions').doc(reference).update({
                 status: data.status,
                 verifiedAt: Date.now(),
                 gatewayResponse: data.gateway_response,
                 paidAt: data.paid_at,
-                amount: data.amount / 100 // Convert from kobo
+                amount: data.amount / 100
             });
 
             return {
@@ -120,17 +117,14 @@ class PaystackService {
     /**
      * Verify webhook signature
      */
-    // src/services/paystack.service.js
-verifyWebhookSignature(req, signature) {
-    // Paystack sends the signature in the header: x-paystack-signature
-    // We compare it against a hash of the raw request body
-    const hash = crypto
-        .createHmac('sha512', PAYSTACK_SECRET_KEY)
-        .update(req.rawBody) // Use the raw buffer captured in server.js
-        .digest('hex');
+    verifyWebhookSignature(req, signature) {
+        const hash = crypto
+            .createHmac('sha512', PAYSTACK_SECRET_KEY)
+            .update(req.rawBody)
+            .digest('hex');
 
-    return hash === signature;
-}
+        return hash === signature;
+    }
 
     /**
      * Create transfer recipient (for withdrawals)
@@ -179,7 +173,7 @@ verifyWebhookSignature(req, signature) {
                 {
                     source: 'balance',
                     reason,
-                    amount: amount * 100, // Convert to kobo
+                    amount: amount * 100,
                     recipient: recipientCode
                 },
                 {
@@ -207,15 +201,20 @@ verifyWebhookSignature(req, signature) {
     }
 
     /**
-     * Get Nigerian banks list
+     * ✅ FIXED: Get Nigerian banks list with proper error handling
      */
     async getBanks() {
         try {
             const response = await axios.get(
-                `${PAYSTACK_BASE_URL}/bank?country=nigeria`,
+                `${PAYSTACK_BASE_URL}/bank`,
                 {
                     headers: {
                         Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`
+                    },
+                    params: {
+                        country: 'nigeria',
+                        use_cursor: false,
+                        perPage: 100
                     }
                 }
             );
@@ -224,26 +223,86 @@ verifyWebhookSignature(req, signature) {
                 throw new Error('Failed to fetch banks');
             }
 
-            return response.data.data.map(bank => ({
-                name: bank.name,
-                code: bank.code,
-                slug: bank.slug,
-                active: bank.active
-            }));
+            // Filter and format banks
+            const banks = response.data.data
+                .filter(bank => bank.active && bank.type !== 'ghipss')
+                .map(bank => ({
+                    name: bank.name,
+                    code: bank.code,
+                    slug: bank.slug,
+                    active: bank.active
+                }))
+                .sort((a, b) => a.name.localeCompare(b.name));
+
+            console.log(`✅ Fetched ${banks.length} active Nigerian banks`);
+            
+            return {
+                success: true,
+                banks
+            };
         } catch (error) {
-            console.error('Fetch banks error:', error.response?.data || error.message);
-            throw new Error('Failed to fetch bank list');
+            console.error('❌ Get banks error:', error.response?.data || error.message);
+            
+            // Return fallback list of major Nigerian banks
+            return {
+                success: true,
+                banks: this.getFallbackBanks()
+            };
         }
     }
 
     /**
-     * Verify bank account
+     * Fallback banks list (major Nigerian banks)
+     */
+    getFallbackBanks() {
+        return [
+            { name: "Access Bank", code: "044", active: true },
+            { name: "Citibank Nigeria", code: "023", active: true },
+            { name: "Ecobank Nigeria", code: "050", active: true },
+            { name: "Fidelity Bank", code: "070", active: true },
+            { name: "First Bank of Nigeria", code: "011", active: true },
+            { name: "First City Monument Bank", code: "214", active: true },
+            { name: "Globus Bank", code: "00103", active: true },
+            { name: "Guaranty Trust Bank", code: "058", active: true },
+            { name: "Heritage Bank", code: "030", active: true },
+            { name: "Keystone Bank", code: "082", active: true },
+            { name: "Kuda Bank", code: "50211", active: true },
+            { name: "Opay", code: "999992", active: true },
+            { name: "PalmPay", code: "999991", active: true },
+            { name: "Polaris Bank", code: "076", active: true },
+            { name: "Providus Bank", code: "101", active: true },
+            { name: "Stanbic IBTC Bank", code: "221", active: true },
+            { name: "Standard Chartered Bank", code: "068", active: true },
+            { name: "Sterling Bank", code: "232", active: true },
+            { name: "Union Bank of Nigeria", code: "032", active: true },
+            { name: "United Bank For Africa", code: "033", active: true },
+            { name: "Unity Bank", code: "215", active: true },
+            { name: "Wema Bank", code: "035", active: true },
+            { name: "Zenith Bank", code: "057", active: true }
+        ].sort((a, b) => a.name.localeCompare(b.name));
+    }
+
+    /**
+     * ✅ FIXED: Verify bank account with better error handling
      */
     async verifyBankAccount(accountNumber, bankCode) {
         try {
+            // Validate inputs
+            if (!accountNumber || accountNumber.length !== 10) {
+                throw new Error('Account number must be exactly 10 digits');
+            }
+
+            if (!bankCode) {
+                throw new Error('Bank code is required');
+            }
+
             const response = await axios.get(
-                `${PAYSTACK_BASE_URL}/bank/resolve?account_number=${accountNumber}&bank_code=${bankCode}`,
+                `${PAYSTACK_BASE_URL}/bank/resolve`,
                 {
+                    params: {
+                        account_number: accountNumber,
+                        bank_code: bankCode
+                    },
                     headers: {
                         Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`
                     }
@@ -251,7 +310,7 @@ verifyWebhookSignature(req, signature) {
             );
 
             if (!response.data.status) {
-                throw new Error('Account verification failed');
+                throw new Error(response.data.message || 'Account verification failed');
             }
 
             return {
@@ -260,8 +319,18 @@ verifyWebhookSignature(req, signature) {
                 accountNumber: response.data.data.account_number
             };
         } catch (error) {
-            console.error('Account verification error:', error.response?.data || error.message);
-            throw new Error(error.response?.data?.message || 'Account verification failed');
+            console.error('❌ Account verification error:', error.response?.data || error.message);
+            
+            // Provide specific error messages
+            if (error.response?.status === 422) {
+                throw new Error('Invalid account number or bank code');
+            }
+            
+            if (error.response?.data?.message) {
+                throw new Error(error.response.data.message);
+            }
+            
+            throw new Error('Could not verify account. Please check the details and try again.');
         }
     }
 

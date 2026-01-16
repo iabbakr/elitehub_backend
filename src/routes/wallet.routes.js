@@ -7,13 +7,171 @@ const paystackService = require('../services/paystack.service');
 const { CACHE_TTL } = require('../config/redis');
 
 /**
- * WALLET ROUTES
- * Production-grade wallet management with caching
+ * ✅ FIXED: Get list of Nigerian banks with caching
  */
+router.get(
+    '/banks',
+    cacheMiddleware(CACHE_TTL.WEEK), // Cache for 7 days
+    async (req, res) => {
+        try {
+            console.log('📋 Fetching banks list...');
+            const result = await paystackService.getBanks();
+
+            res.json({
+                success: true,
+                banks: result.banks
+            });
+        } catch (error) {
+            console.error('❌ Get banks error:', error);
+            
+            // Return fallback even on error
+            res.json({
+                success: true,
+                banks: paystackService.getFallbackBanks(),
+                warning: 'Using cached bank list'
+            });
+        }
+    }
+);
+
+/**
+ * ✅ FIXED: Verify bank account with better validation
+ */
+router.post(
+    '/verify-account',
+    authenticate,
+    userRateLimit(10, 15 * 60 * 1000),
+    async (req, res) => {
+        try {
+            const { accountNumber, bankCode } = req.body;
+
+            // Validation
+            if (!accountNumber || !bankCode) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Account number and bank code are required'
+                });
+            }
+
+            // Validate account number format
+            if (!/^\d{10}$/.test(accountNumber)) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Account number must be exactly 10 digits'
+                });
+            }
+
+            console.log(`🔍 Verifying account: ${accountNumber} with bank code: ${bankCode}`);
+
+            const verification = await paystackService.verifyBankAccount(
+                accountNumber,
+                bankCode
+            );
+
+            res.json(verification);
+        } catch (error) {
+            console.error('❌ Verify account error:', error);
+            res.status(400).json({
+                success: false,
+                message: error.message || 'Account verification failed'
+            });
+        }
+    }
+);
+
+/**
+ * ✅ FIXED: Add bank details with automatic wallet creation
+ */
+router.post(
+    '/add-bank-details',
+    authenticate,
+    userRateLimit(3, 15 * 60 * 1000),
+    async (req, res) => {
+        try {
+            const { accountNumber, bankCode, accountName } = req.body;
+            const userId = req.userId;
+
+            console.log(`💳 Adding bank details for user: ${userId}`);
+
+            // Validate inputs
+            if (!accountNumber || !bankCode) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Account number and bank code are required'
+                });
+            }
+
+            // Validate account number format
+            if (!/^\d{10}$/.test(accountNumber)) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Account number must be exactly 10 digits'
+                });
+            }
+
+            // ✅ ENSURE WALLET EXISTS (Critical Fix)
+            console.log('✅ Ensuring wallet exists for user...');
+            await walletService.ensureWalletExists(userId);
+
+            // Verify account first
+            console.log('🔍 Verifying bank account...');
+            const verification = await paystackService.verifyBankAccount(
+                accountNumber,
+                bankCode
+            );
+
+            if (!verification.success) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Account verification failed. Please check your details.'
+                });
+            }
+
+            console.log(`✅ Account verified: ${verification.accountName}`);
+
+            // Create transfer recipient
+            console.log('📝 Creating transfer recipient...');
+            const recipient = await paystackService.createTransferRecipient(
+                verification.accountName,
+                accountNumber,
+                bankCode
+            );
+
+            console.log(`✅ Recipient created: ${recipient.recipientCode}`);
+
+            // Update user profile
+            const { updateDocument } = require('../config/firebase');
+            await updateDocument('users', userId, {
+                paystackRecipientCode: recipient.recipientCode,
+                bankAccount: {
+                    accountName: verification.accountName,
+                    accountNumber,
+                    bankCode,
+                    verified: true,
+                    addedAt: Date.now()
+                },
+                updatedAt: Date.now()
+            });
+
+            console.log('✅ User profile updated with bank details');
+
+            res.json({
+                success: true,
+                message: 'Bank details added successfully',
+                accountName: verification.accountName
+            });
+        } catch (error) {
+            console.error('❌ Add bank details error:', error);
+            res.status(500).json({
+                success: false,
+                message: error.message || 'Failed to add bank details'
+            });
+        }
+    }
+);
 
 /**
  * GET /api/v1/wallet/balance/:userId
- * Get wallet balance (cached for 5 minutes)
  */
 router.get(
     '/balance/:userId',
@@ -42,7 +200,6 @@ router.get(
 
 /**
  * GET /api/v1/wallet/:userId
- * Get full wallet details with transactions
  */
 router.get(
     '/:userId',
@@ -58,7 +215,7 @@ router.get(
                 wallet: {
                     balance: wallet.balance,
                     pendingBalance: wallet.pendingBalance || 0,
-                    transactions: wallet.transactions.slice(0, 50), // Last 50 transactions
+                    transactions: wallet.transactions.slice(0, 50),
                     currency: 'NGN'
                 }
             });
@@ -74,7 +231,6 @@ router.get(
 
 /**
  * GET /api/v1/wallet/transactions/:userId
- * Get wallet transaction history with pagination
  */
 router.get(
     '/transactions/:userId',
@@ -87,17 +243,14 @@ router.get(
 
             let transactions = wallet.transactions;
 
-            // Filter by type
             if (type) {
                 transactions = transactions.filter(t => t.type === type);
             }
 
-            // Filter by status
             if (status) {
                 transactions = transactions.filter(t => t.status === status);
             }
 
-            // Pagination
             const startIndex = (parseInt(page) - 1) * parseInt(limit);
             const endIndex = startIndex + parseInt(limit);
             const paginatedTransactions = transactions.slice(startIndex, endIndex);
@@ -124,16 +277,14 @@ router.get(
 
 /**
  * POST /api/v1/wallet/debit
- * Generic debit for subscriptions, fees, etc.
  */
 router.post(
     '/debit',
-    authenticate, // Use your existing auth middleware
+    authenticate,
     async (req, res) => {
         try {
             const { userId, amount, description, category, metadata } = req.body;
 
-            // 1. Security check: Ensure user is only debiting their own wallet
             if (req.userId !== userId && req.userRole !== 'admin') {
                 return res.status(403).json({
                     success: false,
@@ -141,7 +292,6 @@ router.post(
                 });
             }
 
-            // 2. Basic validation
             if (!amount || amount <= 0) {
                 return res.status(400).json({
                     success: false,
@@ -149,7 +299,6 @@ router.post(
                 });
             }
 
-            // 3. Call your existing WalletService.debitWallet logic
             const result = await walletService.debitWallet(
                 userId,
                 amount,
@@ -178,18 +327,16 @@ router.post(
 
 /**
  * POST /api/v1/wallet/initialize-deposit
- * Initialize payment for wallet deposit
  */
 router.post(
     '/initialize-deposit',
     authenticate,
-    userRateLimit(10, 15 * 60 * 1000), // 10 deposits per 15 minutes
+    userRateLimit(10, 15 * 60 * 1000),
     async (req, res) => {
         try {
             const { amount } = req.body;
             const userId = req.userId;
 
-            // Validate amount
             if (!amount || amount < 100) {
                 return res.status(400).json({
                     success: false,
@@ -204,7 +351,6 @@ router.post(
                 });
             }
 
-            // Get user email
             const { getDocument } = require('../config/firebase');
             const user = await getDocument('users', userId);
 
@@ -215,7 +361,9 @@ router.post(
                 });
             }
 
-            // Initialize payment with Paystack
+            // Ensure wallet exists
+            await walletService.ensureWalletExists(userId);
+
             const payment = await paystackService.initializePayment(
                 user.email,
                 amount,
@@ -242,7 +390,6 @@ router.post(
 
 /**
  * POST /api/v1/wallet/verify-deposit
- * Verify payment and credit wallet
  */
 router.post(
     '/verify-deposit',
@@ -259,7 +406,6 @@ router.post(
                 });
             }
 
-            // Verify payment with Paystack
             const verification = await paystackService.verifyPayment(reference);
 
             if (!verification.success) {
@@ -270,7 +416,6 @@ router.post(
                 });
             }
 
-            // Credit wallet
             const result = await walletService.creditWallet(
                 req.userId,
                 verification.amount,
@@ -281,7 +426,6 @@ router.post(
                 }
             );
 
-            // Check if already processed
             if (result.alreadyProcessed) {
                 return res.json({
                     success: true,
@@ -307,18 +451,16 @@ router.post(
 
 /**
  * POST /api/v1/wallet/initialize-withdrawal
- * Initialize withdrawal to bank account
  */
 router.post(
     '/initialize-withdrawal',
     authenticate,
-    userRateLimit(5, 15 * 60 * 1000), // 5 withdrawals per 15 minutes
+    userRateLimit(5, 15 * 60 * 1000),
     async (req, res) => {
         try {
             const { amount } = req.body;
             const userId = req.userId;
 
-            // Validate amount
             if (!amount || amount < 1000) {
                 return res.status(400).json({
                     success: false,
@@ -326,7 +468,6 @@ router.post(
                 });
             }
 
-            // Get user and check bank details
             const { getDocument } = require('../config/firebase');
             const user = await getDocument('users', userId);
 
@@ -345,7 +486,6 @@ router.post(
                 });
             }
 
-            // Check wallet balance
             const wallet = await walletService.getWallet(userId);
 
             if (wallet.balance < amount) {
@@ -356,7 +496,6 @@ router.post(
                 });
             }
 
-            // Debit wallet first
             await walletService.debitWallet(
                 userId,
                 amount,
@@ -367,7 +506,6 @@ router.post(
                 }
             );
 
-            // Initiate transfer
             const transfer = await paystackService.initiateTransfer(
                 user.paystackRecipientCode,
                 amount,
@@ -391,136 +529,7 @@ router.post(
 );
 
 /**
- * POST /api/v1/wallet/add-bank-details
- * Add or update bank account details
- */
-router.post(
-    '/add-bank-details',
-    authenticate,
-    userRateLimit(3, 15 * 60 * 1000), // 3 updates per 15 minutes
-    async (req, res) => {
-        try {
-            const { accountNumber, bankCode, accountName } = req.body;
-            const userId = req.userId;
-
-            // Validate inputs
-            if (!accountNumber || !bankCode) {
-                return res.status(400).json({
-                    success: false,
-                    message: 'Account number and bank code are required'
-                });
-            }
-
-            // Verify account
-            const verification = await paystackService.verifyBankAccount(
-                accountNumber,
-                bankCode
-            );
-
-            if (!verification.success) {
-                return res.status(400).json({
-                    success: false,
-                    message: 'Account verification failed. Please check your details.'
-                });
-            }
-
-            // Create transfer recipient
-            const recipient = await paystackService.createTransferRecipient(
-                verification.accountName,
-                accountNumber,
-                bankCode
-            );
-
-            // Update user profile
-            const { updateDocument } = require('../config/firebase');
-            await updateDocument('users', userId, {
-                paystackRecipientCode: recipient.recipientCode,
-                bankAccount: {
-                    accountName: verification.accountName,
-                    accountNumber,
-                    bankCode,
-                    verified: true
-                }
-            });
-
-            res.json({
-                success: true,
-                message: 'Bank details added successfully',
-                accountName: verification.accountName
-            });
-        } catch (error) {
-            console.error('Add bank details error:', error);
-            res.status(500).json({
-                success: false,
-                message: error.message || 'Failed to add bank details'
-            });
-        }
-    }
-);
-
-/**
- * GET /api/v1/wallet/banks
- * Get list of Nigerian banks
- */
-router.get(
-    '/banks',
-    cacheMiddleware(CACHE_TTL.WEEK), // Cache for 7 days
-    async (req, res) => {
-        try {
-            const banks = await paystackService.getBanks();
-
-            res.json({
-                success: true,
-                banks: banks.filter(bank => bank.active)
-            });
-        } catch (error) {
-            console.error('Get banks error:', error);
-            res.status(500).json({
-                success: false,
-                message: 'Failed to fetch banks'
-            });
-        }
-    }
-);
-
-/**
- * POST /api/v1/wallet/verify-account
- * Verify bank account number
- */
-router.post(
-    '/verify-account',
-    authenticate,
-    userRateLimit(10, 15 * 60 * 1000),
-    async (req, res) => {
-        try {
-            const { accountNumber, bankCode } = req.body;
-
-            if (!accountNumber || !bankCode) {
-                return res.status(400).json({
-                    success: false,
-                    message: 'Account number and bank code are required'
-                });
-            }
-
-            const verification = await paystackService.verifyBankAccount(
-                accountNumber,
-                bankCode
-            );
-
-            res.json(verification);
-        } catch (error) {
-            console.error('Verify account error:', error);
-            res.status(500).json({
-                success: false,
-                message: error.message || 'Account verification failed'
-            });
-        }
-    }
-);
-
-/**
  * GET /api/v1/wallet/stats/:userId
- * Get wallet statistics
  */
 router.get(
     '/stats/:userId',
@@ -541,7 +550,6 @@ router.get(
                 lastTransaction: wallet.transactions[0] || null
             };
 
-            // Calculate stats
             wallet.transactions.forEach(txn => {
                 if (txn.type === 'credit') {
                     if (txn.metadata?.type === 'deposit' || txn.description.includes('Top-up')) {
