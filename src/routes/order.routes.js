@@ -459,10 +459,25 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
             });
         }
 
+        // FIX: Check current status
+        if (order.status === 'cancelled') {
+            return res.status(400).json({
+                success: false,
+                message: 'Order is already cancelled'
+            });
+        }
+
+        if (order.status === 'delivered') {
+            return res.status(400).json({
+                success: false,
+                message: 'Cannot cancel delivered orders'
+            });
+        }
+
         if (order.status !== 'running') {
             return res.status(400).json({
                 success: false,
-                message: 'Only running orders can be cancelled'
+                message: `Cannot cancel order with status: ${order.status}`
             });
         }
 
@@ -470,11 +485,11 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
         if (isBuyer && order.trackingStatus) {
             return res.status(400).json({
                 success: false,
-                message: 'Cannot cancel order after tracking has started'
+                message: 'Cannot cancel order after tracking has started. Please contact support.'
             });
         }
 
-        // FIX: Idempotency check
+        // Rest of cancellation logic...
         const lockKey = `order:cancel:${req.params.orderId}`;
         const isLocked = await client.get(lockKey);
         
@@ -488,15 +503,17 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
         await client.setEx(lockKey, 30, 'true');
 
         try {
-            // Update order
+            // Update order status
             await db.collection('orders').doc(req.params.orderId).update({
                 status: 'cancelled',
                 cancelReason: reason || 'No reason provided',
                 sellerCancelled: isSeller,
+                cancelledBy: req.userId,
+                cancelledAt: Date.now(),
                 updatedAt: Date.now()
             });
 
-            // FIX: Refund escrow
+            // Refund escrow
             await walletService.refundEscrow(
                 req.params.orderId,
                 order.buyerId,
@@ -517,7 +534,7 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
 
             res.json({
                 success: true,
-                message: 'Order cancelled successfully'
+                message: 'Order cancelled and refund processed'
             });
 
         } catch (error) {
@@ -529,7 +546,7 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
         console.error('Cancel order error:', error);
         res.status(500).json({
             success: false,
-            message: 'Failed to cancel order'
+            message: error.message || 'Failed to cancel order'
         });
     }
 });
