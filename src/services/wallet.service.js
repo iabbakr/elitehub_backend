@@ -146,7 +146,7 @@ class WalletService {
             await db.runTransaction(async (transaction) => {
                 const walletDoc = await transaction.get(walletRef);
 
-                if (!walletDoc.exists()) {
+                if (!walletDoc.exists) {
                     throw new Error('Wallet not found');
                 }
 
