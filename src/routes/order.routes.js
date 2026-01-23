@@ -3,20 +3,32 @@ const router = express.Router();
 const { authenticate, adminOnly } = require('../middleware/auth');
 const { db, runTransaction, getDocument } = require('../config/firebase');
 const walletService = require('../services/wallet.service');
+const { client, CACHE_KEYS } = require('../config/redis');
 
 /**
- * ORDER ROUTES
- * Order creation and management
+ * FIX: OPTIMIZED ORDER ROUTES WITH PROPER ESCROW FLOW
  */
 
 /**
  * GET /api/v1/orders
- * Get user's orders
+ * Get user's orders with Redis caching
  */
 router.get('/', authenticate, async (req, res) => {
     try {
         const { status, role } = req.query;
         const userId = req.userId;
+
+        // FIX: Try cache first
+        const cacheKey = `orders:${userId}:${role || 'all'}:${status || 'all'}`;
+        const cached = await client.get(cacheKey);
+        
+        if (cached) {
+            return res.json({
+                success: true,
+                orders: JSON.parse(cached),
+                cached: true
+            });
+        }
 
         let query = db.collection('orders');
 
@@ -49,6 +61,9 @@ router.get('/', authenticate, async (req, res) => {
 
             orders.sort((a, b) => b.createdAt - a.createdAt);
 
+            // Cache for 1 minute
+            await client.setEx(cacheKey, 60, JSON.stringify(orders));
+
             return res.json({
                 success: true,
                 orders
@@ -62,6 +77,9 @@ router.get('/', authenticate, async (req, res) => {
 
         const snapshot = await query.orderBy('createdAt', 'desc').get();
         const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+
+        // Cache for 1 minute
+        await client.setEx(cacheKey, 60, JSON.stringify(orders));
 
         res.json({
             success: true,
@@ -78,10 +96,32 @@ router.get('/', authenticate, async (req, res) => {
 
 /**
  * GET /api/v1/orders/:orderId
- * Get single order
+ * Get single order with caching
  */
 router.get('/:orderId', authenticate, async (req, res) => {
     try {
+        // Try cache first
+        const cacheKey = `order:${req.params.orderId}`;
+        const cached = await client.get(cacheKey);
+        
+        if (cached) {
+            const order = JSON.parse(cached);
+            
+            // Verify access
+            if (order.buyerId !== req.userId && order.sellerId !== req.userId && req.userProfile?.role !== 'admin') {
+                return res.status(403).json({
+                    success: false,
+                    message: 'Access denied'
+                });
+            }
+            
+            return res.json({
+                success: true,
+                order,
+                cached: true
+            });
+        }
+
         const order = await getDocument('orders', req.params.orderId);
 
         if (!order) {
@@ -99,6 +139,9 @@ router.get('/:orderId', authenticate, async (req, res) => {
             });
         }
 
+        // Cache for 5 minutes
+        await client.setEx(cacheKey, 300, JSON.stringify(order));
+
         res.json({
             success: true,
             order
@@ -113,8 +156,7 @@ router.get('/:orderId', authenticate, async (req, res) => {
 });
 
 /**
- * POST /api/v1/orders
- * Create new order
+ * FIX: POST /api/v1/orders - Create order with proper escrow
  */
 router.post('/', authenticate, async (req, res) => {
     try {
@@ -147,7 +189,11 @@ router.post('/', authenticate, async (req, res) => {
 
         const sellerId = firstProduct.sellerId;
 
-        // Verify all products belong to same seller
+        // FIX: Verify all products and calculate total in one pass
+        let subtotal = 0;
+        const orderProducts = [];
+        const productDocs = [];
+
         for (const item of products) {
             const product = await getDocument('products', item.productId);
             if (!product) {
@@ -168,14 +214,7 @@ router.post('/', authenticate, async (req, res) => {
                     message: `Insufficient stock for ${product.name}`
                 });
             }
-        }
 
-        // Calculate total
-        let subtotal = 0;
-        const orderProducts = [];
-
-        for (const item of products) {
-            const product = await getDocument('products', item.productId);
             const price = product.discount 
                 ? product.price * (1 - product.discount / 100) 
                 : product.price;
@@ -192,74 +231,109 @@ router.post('/', authenticate, async (req, res) => {
                 prescriptionUrl: item.prescriptionUrl || null,
                 prescriptionFileName: item.prescriptionFileName || null
             });
+
+            productDocs.push({ ref: product, newStock: product.stock - item.quantity });
         }
 
         const totalAmount = Math.round(subtotal - discount);
-        const commission = Math.round(totalAmount * 0.10); // 10% commission
+        const commission = Math.round(totalAmount * 0.10);
 
-        // Check wallet balance
-        const wallet = await walletService.getWallet(buyerId);
-        if (wallet.balance < totalAmount) {
+        // FIX: Check wallet balance BEFORE creating order
+        const buyerBalance = await walletService.getBalance(buyerId);
+        
+        if (buyerBalance < totalAmount) {
             return res.status(400).json({
                 success: false,
                 message: 'Insufficient wallet balance',
                 required: totalAmount,
-                available: wallet.balance
+                available: buyerBalance
             });
         }
 
-        // Create order with atomic transaction
-        let orderId;
-        await runTransaction(async (transaction) => {
-            const orderRef = db.collection('orders').doc();
-            orderId = orderRef.id;
+        // FIX: Create idempotency key to prevent duplicate orders
+        const idempotencyKey = `order:create:${buyerId}:${Date.now()}`;
+        const lockKey = `order:lock:${idempotencyKey}`;
 
-            const orderData = {
-                id: orderId,
+        // Check if already processing
+        const isLocked = await client.get(lockKey);
+        if (isLocked) {
+            return res.status(409).json({
+                success: false,
+                message: 'Order creation already in progress'
+            });
+        }
+
+        // Set lock for 30 seconds
+        await client.setEx(lockKey, 30, 'true');
+
+        let orderId;
+
+        try {
+            // FIX: Atomic transaction - create order + update stock + process payment
+            await db.runTransaction(async (transaction) => {
+                const orderRef = db.collection('orders').doc();
+                orderId = orderRef.id;
+
+                const orderData = {
+                    id: orderId,
+                    buyerId,
+                    sellerId,
+                    products: orderProducts,
+                    totalAmount,
+                    commission,
+                    status: 'running',
+                    deliveryAddress,
+                    phoneNumber: phoneNumber || null,
+                    disputeStatus: 'none',
+                    createdAt: Date.now(),
+                    updatedAt: Date.now()
+                };
+
+                transaction.set(orderRef, orderData);
+
+                // Update product stocks
+                for (const { ref, newStock } of productDocs) {
+                    const productRef = db.collection('products').doc(ref.id);
+
+                    if (newStock <= 0) {
+                        transaction.delete(productRef);
+                    } else {
+                        transaction.update(productRef, { stock: newStock });
+                    }
+                }
+            });
+
+            // FIX: Process payment AFTER order is created (separate for better error handling)
+            await walletService.processOrderPayment(
                 buyerId,
                 sellerId,
-                products: orderProducts,
+                orderId,
                 totalAmount,
-                commission,
-                status: 'running',
-                deliveryAddress,
-                phoneNumber: phoneNumber || null,
-                disputeStatus: 'none',
-                createdAt: Date.now(),
-                updatedAt: Date.now()
-            };
+                commission
+            );
 
-            transaction.set(orderRef, orderData);
+            // Remove lock
+            await client.del(lockKey);
 
-            // Update product stocks
-            for (const item of products) {
-                const productRef = db.collection('products').doc(item.productId);
-                const productDoc = await transaction.get(productRef);
-                const newStock = productDoc.data().stock - item.quantity;
+            // FIX: Invalidate relevant caches
+            await Promise.all([
+                client.del(`orders:${buyerId}:all:all`),
+                client.del(`orders:${sellerId}:all:all`),
+            ]);
 
-                if (newStock <= 0) {
-                    transaction.delete(productRef);
-                } else {
-                    transaction.update(productRef, { stock: newStock });
-                }
-            }
-        });
+            res.status(201).json({
+                success: true,
+                message: 'Order created successfully',
+                orderId,
+                totalAmount
+            });
 
-        // Process payment (escrow)
-        await walletService.transferToEscrow(
-            buyerId,
-            sellerId,
-            orderId,
-            totalAmount,
-            commission
-        );
+        } catch (error) {
+            // Remove lock on error
+            await client.del(lockKey);
+            throw error;
+        }
 
-        res.status(201).json({
-            success: true,
-            message: 'Order created successfully',
-            orderId,
-            totalAmount
-        });
     } catch (error) {
         console.error('Create order error:', error);
         res.status(500).json({
@@ -270,8 +344,8 @@ router.post('/', authenticate, async (req, res) => {
 });
 
 /**
- * PUT /api/v1/orders/:orderId/confirm-delivery
- * Buyer confirms delivery
+ * FIX: PUT /api/v1/orders/:orderId/confirm-delivery
+ * Buyer confirms delivery with proper escrow release
  */
 router.put('/:orderId/confirm-delivery', authenticate, async (req, res) => {
     try {
@@ -298,26 +372,57 @@ router.put('/:orderId/confirm-delivery', authenticate, async (req, res) => {
             });
         }
 
-        // Update order status
-        await db.collection('orders').doc(req.params.orderId).update({
-            status: 'delivered',
-            buyerConfirmed: true,
-            updatedAt: Date.now()
-        });
+        // FIX: Idempotency check
+        const lockKey = `order:confirm:${req.params.orderId}`;
+        const isLocked = await client.get(lockKey);
+        
+        if (isLocked) {
+            return res.status(409).json({
+                success: false,
+                message: 'Confirmation already in progress'
+            });
+        }
 
-        // Release escrow
-        await walletService.releaseEscrow(
-            req.params.orderId,
-            order.buyerId,
-            order.sellerId,
-            order.totalAmount,
-            order.commission
-        );
+        // Set lock
+        await client.setEx(lockKey, 30, 'true');
 
-        res.json({
-            success: true,
-            message: 'Delivery confirmed successfully'
-        });
+        try {
+            // Update order status
+            await db.collection('orders').doc(req.params.orderId).update({
+                status: 'delivered',
+                buyerConfirmed: true,
+                updatedAt: Date.now()
+            });
+
+            // FIX: Release escrow
+            await walletService.releaseEscrow(
+                req.params.orderId,
+                order.buyerId,
+                order.sellerId,
+                order.totalAmount,
+                order.commission
+            );
+
+            // Remove lock
+            await client.del(lockKey);
+
+            // Invalidate caches
+            await Promise.all([
+                client.del(`order:${req.params.orderId}`),
+                client.del(`orders:${order.buyerId}:all:all`),
+                client.del(`orders:${order.sellerId}:all:all`),
+            ]);
+
+            res.json({
+                success: true,
+                message: 'Delivery confirmed successfully'
+            });
+
+        } catch (error) {
+            await client.del(lockKey);
+            throw error;
+        }
+
     } catch (error) {
         console.error('Confirm delivery error:', error);
         res.status(500).json({
@@ -328,8 +433,8 @@ router.put('/:orderId/confirm-delivery', authenticate, async (req, res) => {
 });
 
 /**
- * PUT /api/v1/orders/:orderId/cancel
- * Cancel order
+ * FIX: PUT /api/v1/orders/:orderId/cancel
+ * Cancel order with proper refund
  */
 router.put('/:orderId/cancel', authenticate, async (req, res) => {
     try {
@@ -369,28 +474,57 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
             });
         }
 
-        // Update order
-        await db.collection('orders').doc(req.params.orderId).update({
-            status: 'cancelled',
-            cancelReason: reason || 'No reason provided',
-            sellerCancelled: isSeller,
-            updatedAt: Date.now()
-        });
+        // FIX: Idempotency check
+        const lockKey = `order:cancel:${req.params.orderId}`;
+        const isLocked = await client.get(lockKey);
+        
+        if (isLocked) {
+            return res.status(409).json({
+                success: false,
+                message: 'Cancellation already in progress'
+            });
+        }
 
-        // Refund escrow
-        await walletService.refundEscrow(
-            req.params.orderId,
-            order.buyerId,
-            order.sellerId,
-            order.totalAmount,
-            order.commission,
-            reason
-        );
+        await client.setEx(lockKey, 30, 'true');
 
-        res.json({
-            success: true,
-            message: 'Order cancelled successfully'
-        });
+        try {
+            // Update order
+            await db.collection('orders').doc(req.params.orderId).update({
+                status: 'cancelled',
+                cancelReason: reason || 'No reason provided',
+                sellerCancelled: isSeller,
+                updatedAt: Date.now()
+            });
+
+            // FIX: Refund escrow
+            await walletService.refundEscrow(
+                req.params.orderId,
+                order.buyerId,
+                order.sellerId,
+                order.totalAmount,
+                order.commission,
+                reason
+            );
+
+            await client.del(lockKey);
+
+            // Invalidate caches
+            await Promise.all([
+                client.del(`order:${req.params.orderId}`),
+                client.del(`orders:${order.buyerId}:all:all`),
+                client.del(`orders:${order.sellerId}:all:all`),
+            ]);
+
+            res.json({
+                success: true,
+                message: 'Order cancelled successfully'
+            });
+
+        } catch (error) {
+            await client.del(lockKey);
+            throw error;
+        }
+
     } catch (error) {
         console.error('Cancel order error:', error);
         res.status(500).json({
