@@ -439,6 +439,8 @@ router.put('/:orderId/confirm-delivery', authenticate, async (req, res) => {
 router.put('/:orderId/cancel', authenticate, async (req, res) => {
     try {
         const { reason } = req.body;
+        
+        // ✅ Get FRESH order data
         const order = await getDocument('orders', req.params.orderId);
 
         if (!order) {
@@ -447,6 +449,16 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
                 message: 'Order not found'
             });
         }
+
+        // ✅ Log current order state for debugging
+        console.log('📦 Cancel request for order:', {
+            orderId: order.id,
+            currentStatus: order.status,
+            trackingStatus: order.trackingStatus,
+            requestedBy: req.userId,
+            isBuyer: order.buyerId === req.userId,
+            isSeller: order.sellerId === req.userId
+        });
 
         // Check permissions
         const isBuyer = order.buyerId === req.userId;
@@ -459,51 +471,57 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
             });
         }
 
-        // FIX: Check current status
+        // ✅ FIX: More specific status checking with better error messages
         if (order.status === 'cancelled') {
             return res.status(400).json({
                 success: false,
-                message: 'Order is already cancelled'
+                message: 'Order is already cancelled',
+                currentStatus: order.status
             });
         }
 
         if (order.status === 'delivered') {
             return res.status(400).json({
                 success: false,
-                message: 'Cannot cancel delivered orders'
+                message: 'Cannot cancel delivered orders',
+                currentStatus: order.status
             });
         }
 
         if (order.status !== 'running') {
             return res.status(400).json({
                 success: false,
-                message: `Cannot cancel order with status: ${order.status}`
+                message: `Only running orders can be cancelled. Current status: ${order.status}`,
+                currentStatus: order.status
             });
         }
 
-        // Buyer can't cancel after tracking started
+        // ✅ Buyer-specific rules
         if (isBuyer && order.trackingStatus) {
             return res.status(400).json({
                 success: false,
-                message: 'Cannot cancel order after tracking has started. Please contact support.'
+                message: 'Cannot cancel order after seller has confirmed it. Please contact support if there is an issue.',
+                currentStatus: order.status,
+                trackingStatus: order.trackingStatus
             });
         }
 
-        // Rest of cancellation logic...
+        // ✅ Idempotency check
         const lockKey = `order:cancel:${req.params.orderId}`;
         const isLocked = await client.get(lockKey);
         
         if (isLocked) {
             return res.status(409).json({
                 success: false,
-                message: 'Cancellation already in progress'
+                message: 'Cancellation already in progress. Please wait.'
             });
         }
 
+        // Set lock for 30 seconds
         await client.setEx(lockKey, 30, 'true');
 
         try {
-            // Update order status
+            // ✅ Update order status
             await db.collection('orders').doc(req.params.orderId).update({
                 status: 'cancelled',
                 cancelReason: reason || 'No reason provided',
@@ -513,37 +531,45 @@ router.put('/:orderId/cancel', authenticate, async (req, res) => {
                 updatedAt: Date.now()
             });
 
-            // Refund escrow
+            console.log('✅ Order status updated to cancelled');
+
+            // ✅ Refund escrow
             await walletService.refundEscrow(
                 req.params.orderId,
                 order.buyerId,
                 order.sellerId,
                 order.totalAmount,
                 order.commission,
-                reason
+                reason || 'Order cancelled'
             );
 
+            console.log('✅ Escrow refunded successfully');
+
+            // Remove lock
             await client.del(lockKey);
 
-            // Invalidate caches
+            // ✅ Invalidate caches
             await Promise.all([
                 client.del(`order:${req.params.orderId}`),
                 client.del(`orders:${order.buyerId}:all:all`),
                 client.del(`orders:${order.sellerId}:all:all`),
             ]);
 
+            console.log('✅ Caches invalidated');
+
             res.json({
                 success: true,
-                message: 'Order cancelled and refund processed'
+                message: 'Order cancelled and refund processed successfully'
             });
 
         } catch (error) {
+            // Remove lock on error
             await client.del(lockKey);
             throw error;
         }
 
     } catch (error) {
-        console.error('Cancel order error:', error);
+        console.error('❌ Cancel order error:', error);
         res.status(500).json({
             success: false,
             message: error.message || 'Failed to cancel order'
