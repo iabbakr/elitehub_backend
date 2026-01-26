@@ -9,6 +9,220 @@ const { client, CACHE_KEYS } = require('../config/redis');
  * FIX: OPTIMIZED ORDER ROUTES WITH PROPER ESCROW FLOW
  */
 
+
+router.post('/:orderId/review', authenticate, async (req, res) => {
+    try {
+        const { rating, comment } = req.body;
+        const { orderId } = req.params;
+        const userId = req.userId;
+
+        // 1. Validation
+        if (!rating || rating < 1 || rating > 5) {
+            return res.status(400).json({ success: false, message: 'Valid rating (1-5) is required' });
+        }
+
+        // 2. Fetch Fresh Order Data
+        const order = await getDocument('orders', orderId);
+
+        if (!order) {
+            return res.status(404).json({ success: false, message: 'Order not found' });
+        }
+
+        // 3. Security & Business Logic Checks
+        if (order.buyerId !== userId) {
+            return res.status(403).json({ success: false, message: 'Only the buyer can review this order' });
+        }
+
+        if (order.status !== 'delivered') {
+            return res.status(400).json({ success: false, message: 'You can only review delivered orders' });
+        }
+
+        if (order.hasReview) {
+            return res.status(400).json({ success: false, message: 'Review already submitted for this order' });
+        }
+
+        // 4. Atomic Transaction: Save Review & Update Order/Product/Seller
+        await db.runTransaction(async (transaction) => {
+            const reviewRef = db.collection('reviews').doc();
+            const orderRef = db.collection('orders').doc(orderId);
+            const sellerRef = db.collection('users').doc(order.sellerId);
+
+            // Create Review Object
+            transaction.set(reviewRef, {
+                id: reviewRef.id,
+                orderId,
+                buyerId: userId,
+                sellerId: order.sellerId,
+                rating,
+                comment: comment || '',
+                productNames: order.products.map(p => p.productName),
+                createdAt: Date.now()
+            });
+
+            // Mark Order as Reviewed
+            transaction.update(orderRef, { 
+                hasReview: true,
+                updatedAt: Date.now() 
+            });
+
+            // Optional: Update Seller Rating Average
+            const sellerDoc = await transaction.get(sellerRef);
+            const sellerData = sellerDoc.data();
+            const newTotalReviews = (sellerData.totalReviews || 0) + 1;
+            const newAvgRating = sellerData.rating 
+                ? ((sellerData.rating * (newTotalReviews - 1)) + rating) / newTotalReviews 
+                : rating;
+
+            transaction.update(sellerRef, {
+                rating: Number(newAvgRating.toFixed(1)),
+                totalReviews: newTotalReviews
+            });
+        });
+
+        // 5. Invalidate Caches
+        await Promise.all([
+            client.del(`order:${orderId}`),
+            client.del(`orders:${userId}:all:all`),
+            client.del(`seller_profile:${order.sellerId}`)
+        ]);
+
+        res.status(201).json({
+            success: true,
+            message: 'Review submitted successfully'
+        });
+
+    } catch (error) {
+        console.error('Review submission error:', error);
+        res.status(500).json({ success: false, message: 'Failed to submit review' });
+    }
+});
+
+/**
+ * PUT /api/v1/orders/:orderId/tracking
+ * Update tracking status (Seller Only)
+ */
+
+const VALID_TRACKING_STATUSES = ['acknowledged', 'enroute', 'ready_for_pickup'];
+
+router.put('/:orderId/tracking', authenticate, async (req, res) => {
+    try {
+        const { status } = req.body;
+    if (!VALID_TRACKING_STATUSES.includes(status)) {
+        return res.status(400).json({ success: false, message: 'Invalid tracking status' });
+    }
+        //const { status } = req.body; // acknowledged, enroute, ready_for_pickup
+        const { orderId } = req.params;
+
+        const order = await getDocument('orders', orderId);
+        if (!order || order.sellerId !== req.userId) {
+            return res.status(403).json({ success: false, message: 'Access denied' });
+        }
+
+        await db.collection('orders').doc(orderId).update({
+            trackingStatus: status,
+            updatedAt: Date.now()
+        });
+
+        await client.del(`order:${orderId}`);
+        
+        res.json({ success: true, message: `Status updated to ${status}` });
+    } catch (error) {
+        res.status(500).json({ success: false, message: 'Update failed' });
+    }
+});
+
+/**
+ * GET /api/v1/orders/seller/stats
+ * Get seller-specific performance metrics and revenue analytics
+ */
+router.get('/seller/stats', authenticate, async (req, res) => {
+    try {
+        const sellerId = req.userId;
+        const { period = 'week' } = req.query; // 'week' or 'month'
+
+        // Define timeframe
+        const now = Date.now();
+        const startTime = period === 'month' 
+            ? now - (30 * 24 * 60 * 60 * 1000) 
+            : now - (7 * 24 * 60 * 60 * 1000);
+
+        // Fetch completed orders for this seller in the timeframe
+        const snapshot = await db.collection('orders')
+            .where('sellerId', '==', sellerId)
+            .where('status', '==', 'delivered')
+            .where('updatedAt', '>=', startTime)
+            .get();
+
+        const orders = snapshot.docs.map(doc => doc.data());
+
+        // Calculate Stats
+        const totalOrders = orders.length;
+        const grossRevenue = orders.reduce((sum, o) => sum + o.totalAmount, 0);
+        const platformFees = orders.reduce((sum, o) => sum + (o.commission || 0), 0);
+        const netEarnings = grossRevenue - platformFees;
+
+        // Group revenue by day for a chart
+        const revenueByDay = {};
+        orders.forEach(o => {
+            const date = new Date(o.updatedAt).toISOString().split('T')[0];
+            revenueByDay[date] = (revenueByDay[date] || 0) + (o.totalAmount - (o.commission || 0));
+        });
+
+        res.json({
+            success: true,
+            stats: {
+                period,
+                totalOrders,
+                grossRevenue,
+                platformFees,
+                netEarnings,
+                averageOrderValue: totalOrders > 0 ? Math.round(grossRevenue / totalOrders) : 0,
+                revenueByDay
+            }
+        });
+    } catch (error) {
+        console.error('Seller stats error:', error);
+        res.status(500).json({ success: false, message: 'Failed to fetch analytics' });
+    }
+});
+
+/**
+ * GET /api/v1/orders/admin/automation-stats
+ * View stats on auto-cancellations and system health
+ */
+router.get('/admin/automation-stats', authenticate, adminOnly, async (req, res) => {
+    try {
+        // 1. Get total auto-cancelled orders
+        const cancelledSnapshot = await db.collection('orders')
+            .where('autoCancelled', '==', true)
+            .orderBy('updatedAt', 'desc')
+            .limit(20)
+            .get();
+
+        const recentCancellations = cancelledSnapshot.docs.map(doc => ({
+            id: doc.id,
+            sellerId: doc.data().sellerId,
+            amount: doc.data().totalAmount,
+            time: doc.data().updatedAt
+        }));
+
+        // 2. Get system heartbeat status from Redis
+        const lastHeartbeat = await client.get('system:keepalive');
+
+        res.json({
+            success: true,
+            data: {
+                totalAutoCancelledCount: cancelledSnapshot.size,
+                lastSystemPulse: lastHeartbeat,
+                recentCancellations,
+                status: lastHeartbeat ? "Automation Active" : "Automation Pending"
+            }
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
 /**
  * GET /api/v1/orders
  * Get user's orders with Redis caching

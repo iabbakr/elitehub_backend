@@ -6,6 +6,10 @@ const rateLimit = require('express-rate-limit');
 const compression = require('compression');
 const { connectRedis } = require('./src/config/redis');
 const { db } = require('./src/config/firebase');
+require('./src/jobs/orderCleanup');
+// In server.js
+require('./src/jobs/orderCleanup');
+require('./src/jobs/keepAlive'); // Add this line
 
 // Route Imports
 const walletRoutes = require('./src/routes/wallet.routes');
