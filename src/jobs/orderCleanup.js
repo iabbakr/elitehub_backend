@@ -1,8 +1,7 @@
 const cron = require('node-cron');
-const { db } = require('../config/firebase');
+const { db, runTransaction, sendPushNotification } = require('../config/firebase'); // Corrected imports
 const walletService = require('../services/wallet.service');
 const { client } = require('../config/redis');
-const firebaseService = require('../services/firebase.service'); 
 
 const SUSPENSION_THRESHOLD = 3; 
 
@@ -26,7 +25,7 @@ cron.schedule('0 * * * *', async () => {
             const orderId = doc.id;
 
             try {
-                // 1. Atomic status update for Order
+                // 1. Update Order Status
                 await db.collection('orders').doc(orderId).update({
                     status: 'cancelled',
                     cancelReason: 'Auto-cancelled: Seller failed to acknowledge within 48 hours.',
@@ -34,10 +33,10 @@ cron.schedule('0 * * * *', async () => {
                     autoCancelled: true
                 });
 
-                // --- 1.5 MISSING STRIKE & SUSPENSION LOGIC ---
+                // 2. Strike & Suspension Logic
                 const sellerRef = db.collection('users').doc(order.sellerId);
                 
-                await db.runTransaction(async (transaction) => {
+                await runTransaction(async (transaction) => {
                     const sellerDoc = await transaction.get(sellerRef);
                     if (!sellerDoc.exists) return;
 
@@ -52,17 +51,15 @@ cron.schedule('0 * * * *', async () => {
                         updatedAt: Date.now()
                     });
 
-                    // Notify Seller of their specific strike status
                     const sellerMsg = shouldSuspend 
                         ? "🚨 Your account has been suspended due to repeated inactivity."
                         : `⚠️ Warning: You have ${currentStrikes}/${SUSPENSION_THRESHOLD} strikes for unacknowledged orders.`;
                     
-                    // We don't await inside transaction, we trigger after
-                    firebaseService.sendPushToUser(order.sellerId, "Shop Update", sellerMsg, { screen: "SellerDashboard" });
+                    // Use the corrected helper name
+                    await sendPushNotification(order.sellerId, "Shop Update", sellerMsg, { screen: "SellerDashboard" });
                 });
-                // ----------------------------------------------
 
-                // 2. Process Refund
+                // 3. Process Refund
                 await walletService.refundEscrow(
                     orderId,
                     order.buyerId,
@@ -72,25 +69,25 @@ cron.schedule('0 * * * *', async () => {
                     'Seller inactivity refund'
                 );
 
-                // 3. Notify Buyer
-                await firebaseService.sendPushToUser(
+                // 4. Notify Buyer
+                await sendPushNotification(
                     order.buyerId,
                     "💸 Refund Processed",
                     `Order #${orderId.slice(-6).toUpperCase()} was cancelled. Funds returned to wallet.`,
                     { screen: "WalletTab" }
                 );
 
-                // 4. Clean Cache
+                // 5. Clean Cache
                 await Promise.all([
                     client.del(`order:${orderId}`),
                     client.del(`orders:${order.buyerId}:all:all`),
                     client.del(`orders:${order.sellerId}:all:all`),
-                    client.del(`user:${order.sellerId}:profile`) // Force dashboard refresh
+                    client.del(`user:${order.sellerId}:profile`)
                 ]);
 
-                console.log(`✅ Auto-cancelled, Issued Strike, and Notified: ${orderId}`);
+                console.log(`✅ Processed order ${orderId}`);
             } catch (err) {
-                console.error(`❌ Failed to process auto-cancel for ${orderId}:`, err);
+                console.error(`❌ Failed to process ${orderId}:`, err);
             }
         }
     } catch (error) {

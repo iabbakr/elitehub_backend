@@ -271,6 +271,40 @@ async function deleteFile(filePath) {
     }
 }
 
+/**
+ * PUSH NOTIFICATION HELPER
+ * Sends a notification via the Expo Push API
+ */
+async function sendPushNotification(userId, title, body, data = {}) {
+    try {
+        const tokenDoc = await db.collection('pushTokens').doc(userId).get();
+        if (!tokenDoc.exists) {
+            console.log(`⚠️ No push token found for user ${userId}`);
+            return;
+        }
+
+        const { token } = tokenDoc.data();
+        const axios = require('axios');
+
+        const message = {
+            to: token,
+            sound: 'default',
+            title,
+            body,
+            data,
+            priority: 'high',
+            badge: data.badge || 0
+        };
+
+        await axios.post('https://exp.host/--/api/v2/push/send', message);
+        console.log(`🔔 Notification sent to user ${userId}`);
+    } catch (error) {
+        console.error("❌ Push Error:", error.message);
+    }
+
+}
+
+
 module.exports = {
     db,
     auth,
@@ -290,5 +324,6 @@ module.exports = {
     createCustomToken,
     // Storage helpers
     getSignedUrl,
-    deleteFile
+    deleteFile,
+    sendPushNotification
 };
