@@ -1,11 +1,11 @@
-// src/services/wallet.service.js - PRODUCTION-GRADE WITH REDIS & IDEMPOTENCY
+// src/services/wallet.service.js - FIREBASE AS SOURCE OF TRUTH
 const { db, admin } = require('../config/firebase');
-const { client, CACHE_KEYS, CACHE_TTL } = require('../config/redis');
+const { client } = require('../config/redis');
 
 class WalletService {
     /**
-     * FIX: Ensure wallet exists with proper initialization.
-     * In Firebase Admin SDK, .exists is a property, not a function.
+     * ✅ FIREBASE SOURCE OF TRUTH
+     * Ensure wallet exists with proper initialization
      */
     async ensureWalletExists(userId) {
         try {
@@ -20,7 +20,8 @@ class WalletService {
                     balance: 0,
                     pendingBalance: 0,
                     createdAt: admin.firestore.FieldValue.serverTimestamp(),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                    version: 1
                 };
 
                 await walletRef.set(newWallet);
@@ -36,14 +37,14 @@ class WalletService {
     }
 
     /**
-     * FIX: Credit wallet with idempotency.
-     * Prevents duplicate processing of the same payment reference.
+     * ✅ FIREBASE ATOMIC TRANSACTION: Credit wallet with idempotency
+     * Prevents duplicate processing of the same payment reference
      */
     async creditWallet(userId, amount, reference, metadata = {}) {
         const lockKey = `payment:lock:${reference}`;
 
         try {
-            // Check Redis for idempotency
+            // Redis check for idempotency (cost-cutting & security)
             const isProcessed = await client.get(lockKey);
             if (isProcessed) {
                 console.log('⚠️ Payment already processed:', reference);
@@ -55,6 +56,7 @@ class WalletService {
             const walletRef = db.collection('wallets').doc(userId);
             const txnRef = walletRef.collection('transactions').doc(reference);
 
+            // FIREBASE TRANSACTION - Source of truth update
             await db.runTransaction(async (transaction) => {
                 const walletDoc = await transaction.get(walletRef);
                 
@@ -66,7 +68,7 @@ class WalletService {
                     id: reference,
                     type: 'credit',
                     amount: parseFloat(amount),
-                    description: metadata.description || `Credit - ${reference}`,
+                    description: metadata.description || `Wallet Top-up - ${reference}`,
                     timestamp: Date.now(),
                     status: 'completed',
                     metadata: {
@@ -76,18 +78,23 @@ class WalletService {
                     }
                 };
 
+                // Update balance in Firebase (source of truth)
                 transaction.update(walletRef, {
                     balance: admin.firestore.FieldValue.increment(amount),
                     updatedAt: admin.firestore.FieldValue.serverTimestamp()
                 });
 
+                // Add transaction to sub-collection
                 transaction.set(txnRef, txnData);
             });
 
-            // Mark as processed in Redis (24-hour expiry)
+            // Mark as processed in Redis (24-hour expiry for duplicate prevention)
             await client.setEx(lockKey, 86400, 'true');
+            
+            // Invalidate balance cache
             await this.invalidateWalletCache(userId);
 
+            console.log(`✅ Credited ${amount} to wallet ${userId}`);
             return { success: true, alreadyProcessed: false };
         } catch (error) {
             console.error('❌ Credit wallet error:', error);
@@ -96,16 +103,15 @@ class WalletService {
     }
 
     /**
-     * ENHANCED: Debit wallet with Idempotency Key logic.
-     * Prevents double-charging users during network retries or timeouts.
+     * ✅ FIREBASE ATOMIC TRANSACTION: Debit wallet with idempotency
+     * Prevents double-charging during network retries
      */
     async debitWallet(userId, amount, description, metadata = {}) {
-        // Use provided idempotencyKey from frontend or fallback to a timestamp-based ref
         const reference = metadata.idempotencyKey || metadata.reference || `db_${Date.now()}_${userId.slice(0, 4)}`;
         const lockKey = `debit:lock:${reference}`;
 
         try {
-            // 1. Check Redis for existing transaction result
+            // Check Redis for duplicate request
             const cachedResult = await client.get(lockKey);
             if (cachedResult) {
                 console.log('⚠️ Duplicate debit request blocked:', reference);
@@ -117,6 +123,7 @@ class WalletService {
             const walletRef = db.collection('wallets').doc(userId);
             const txnRef = walletRef.collection('transactions').doc(reference);
 
+            // FIREBASE TRANSACTION - Source of truth update
             const result = await db.runTransaction(async (transaction) => {
                 const walletDoc = await transaction.get(walletRef);
 
@@ -144,20 +151,23 @@ class WalletService {
                     }
                 };
 
+                // Update balance in Firebase (source of truth)
                 transaction.update(walletRef, {
                     balance: admin.firestore.FieldValue.increment(-amount),
                     updatedAt: admin.firestore.FieldValue.serverTimestamp()
                 });
 
+                // Add transaction to sub-collection
                 transaction.set(txnRef, txnData);
 
                 return { success: true, transaction: txnData };
             });
 
-            // 2. Cache successful result for 24 hours to handle retries
+            // Cache successful result for 24 hours
             await client.setEx(lockKey, 86400, JSON.stringify(result));
             await this.invalidateWalletCache(userId);
 
+            console.log(`✅ Debited ${amount} from wallet ${userId}`);
             return result;
 
         } catch (error) {
@@ -167,21 +177,27 @@ class WalletService {
     }
 
     /**
-     * FIX: Get wallet with multi-layer caching.
+     * ✅ Get wallet from FIREBASE (source of truth)
+     * Redis used ONLY for caching, not as source
      */
     async getWallet(userId) {
-        const cacheKey = CACHE_KEYS.USER_WALLET(userId);
+        const cacheKey = `wallet:cache:${userId}`;
 
         try {
+            // Try Redis cache first
             const cached = await client.get(cacheKey);
-            if (cached) return JSON.parse(cached);
+            if (cached) {
+                return JSON.parse(cached);
+            }
 
+            // FIREBASE IS SOURCE OF TRUTH
             await this.ensureWalletExists(userId);
 
             const walletRef = db.collection('wallets').doc(userId);
             const walletDoc = await walletRef.get();
             const wallet = walletDoc.data();
 
+            // Get recent transactions from sub-collection
             const txnsSnapshot = await walletRef
                 .collection('transactions')
                 .orderBy('timestamp', 'desc')
@@ -195,7 +211,9 @@ class WalletService {
 
             const walletData = { ...wallet, transactions };
 
-            await client.setEx(cacheKey, CACHE_TTL.MEDIUM, JSON.stringify(walletData));
+            // Cache in Redis for 5 minutes
+            await client.setEx(cacheKey, 300, JSON.stringify(walletData));
+            
             return walletData;
 
         } catch (error) {
@@ -205,53 +223,68 @@ class WalletService {
     }
 
     /**
-     * FIX: Get balance only.
+     * ✅ Get balance from FIREBASE (source of truth)
      */
     async getBalance(userId) {
-        const balanceKey = `${CACHE_KEYS.USER_WALLET(userId)}:balance`;
+        const balanceKey = `wallet:balance:${userId}`;
 
         try {
+            // Try Redis cache
             const cached = await client.get(balanceKey);
-            if (cached) return parseFloat(cached);
+            if (cached) {
+                return parseFloat(cached);
+            }
 
+            // FIREBASE IS SOURCE OF TRUTH
             const walletRef = db.collection('wallets').doc(userId);
             const walletDoc = await walletRef.get();
 
-            if (!walletDoc.exists) return 0;
+            if (!walletDoc.exists()) {
+                await this.ensureWalletExists(userId);
+                return 0;
+            }
 
             const balance = walletDoc.data().balance || 0;
-            await client.setEx(balanceKey, CACHE_TTL.SHORT, balance.toString());
+            
+            // Cache for 30 seconds
+            await client.setEx(balanceKey, 30, balance.toString());
 
             return balance;
         } catch (error) {
+            console.error('❌ Get balance error:', error);
             return 0;
         }
     }
 
     /**
-     * FIX: Invalidate all wallet-related caches.
+     * ✅ Invalidate Redis cache (not source of truth)
      */
     async invalidateWalletCache(userId) {
         try {
             const keys = [
-                CACHE_KEYS.USER_WALLET(userId),
-                `${CACHE_KEYS.USER_WALLET(userId)}:balance`,
+                `wallet:cache:${userId}`,
+                `wallet:balance:${userId}`,
             ];
             await Promise.all(keys.map(key => client.del(key)));
+            console.log(`🗑️  Cache invalidated for user: ${userId}`);
         } catch (error) {
-            console.warn('Cache invalidation error:', error);
+            console.warn('⚠️  Cache invalidation error:', error);
         }
     }
 
     /**
-     * FIX: Process order payment with escrow.
+     * ✅ FIREBASE ATOMIC TRANSACTION: Process order payment with escrow
      */
     async processOrderPayment(buyerId, sellerId, orderId, totalAmount, commission) {
         const lockKey = `order:payment:${orderId}`;
 
         try {
+            // Check if already processed
             const isProcessed = await client.get(lockKey);
-            if (isProcessed) return { success: true, alreadyProcessed: true };
+            if (isProcessed) {
+                console.log('⚠️ Order payment already processed:', orderId);
+                return { success: true, alreadyProcessed: true };
+            }
 
             await Promise.all([
                 this.ensureWalletExists(buyerId),
@@ -261,20 +294,48 @@ class WalletService {
             const buyerRef = db.collection('wallets').doc(buyerId);
             const sellerRef = db.collection('wallets').doc(sellerId);
 
+            // FIREBASE ATOMIC TRANSACTION
             await db.runTransaction(async (transaction) => {
                 const [buyerDoc, sellerDoc] = await Promise.all([
                     transaction.get(buyerRef),
                     transaction.get(sellerRef)
                 ]);
 
-                if (buyerDoc.data().balance < totalAmount) {
+                const buyerWallet = buyerDoc.data();
+                const sellerWallet = sellerDoc.data();
+
+                if (buyerWallet.balance < totalAmount) {
                     throw new Error('Insufficient balance');
                 }
+
+                // Debit buyer
+                const buyerTxnRef = buyerRef.collection('transactions').doc();
+                transaction.set(buyerTxnRef, {
+                    id: buyerTxnRef.id,
+                    type: 'debit',
+                    amount: totalAmount,
+                    description: `Order #${orderId.slice(-6)} - Escrow`,
+                    timestamp: Date.now(),
+                    status: 'pending',
+                    metadata: { orderId, commission }
+                });
 
                 transaction.update(buyerRef, {
                     balance: admin.firestore.FieldValue.increment(-totalAmount),
                     pendingBalance: admin.firestore.FieldValue.increment(totalAmount),
                     updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+
+                // Pending credit for seller
+                const sellerTxnRef = sellerRef.collection('transactions').doc();
+                transaction.set(sellerTxnRef, {
+                    id: sellerTxnRef.id,
+                    type: 'credit',
+                    amount: totalAmount - commission,
+                    description: `Order #${orderId.slice(-6)} - Pending`,
+                    timestamp: Date.now(),
+                    status: 'pending',
+                    metadata: { orderId, commission }
                 });
 
                 transaction.update(sellerRef, {
@@ -283,27 +344,32 @@ class WalletService {
                 });
             });
 
+            // Mark as processed
             await client.setEx(lockKey, 86400, 'true');
+            
+            // Invalidate caches
             await Promise.all([
                 this.invalidateWalletCache(buyerId),
                 this.invalidateWalletCache(sellerId)
             ]);
 
+            console.log(`✅ Order payment processed: ${orderId}`);
             return { success: true };
         } catch (error) {
-            console.error('Process order payment error:', error);
+            console.error('❌ Process order payment error:', error);
             throw error;
         }
     }
 
     /**
-     * FIX: Release escrow on delivery.
+     * ✅ FIREBASE ATOMIC TRANSACTION: Release escrow on delivery
      */
     async releaseEscrow(orderId, buyerId, sellerId, totalAmount, commission) {
         try {
             const sellerRef = db.collection('wallets').doc(sellerId);
             const buyerRef = db.collection('wallets').doc(buyerId);
 
+            // FIREBASE ATOMIC TRANSACTION
             await db.runTransaction(async (transaction) => {
                 const [sellerDoc, buyerDoc] = await Promise.all([
                     transaction.get(sellerRef),
@@ -312,12 +378,25 @@ class WalletService {
 
                 const sellerAmount = totalAmount - commission;
 
+                // Release to seller
+                const sellerTxnRef = sellerRef.collection('transactions').doc();
+                transaction.set(sellerTxnRef, {
+                    id: sellerTxnRef.id,
+                    type: 'credit',
+                    amount: sellerAmount,
+                    description: `Order #${orderId.slice(-6)} - Payment Released`,
+                    timestamp: Date.now(),
+                    status: 'completed',
+                    metadata: { orderId, commission }
+                });
+
                 transaction.update(sellerRef, {
                     balance: admin.firestore.FieldValue.increment(sellerAmount),
                     pendingBalance: admin.firestore.FieldValue.increment(-sellerAmount),
                     updatedAt: admin.firestore.FieldValue.serverTimestamp()
                 });
 
+                // Remove from buyer's pending
                 transaction.update(buyerRef, {
                     pendingBalance: admin.firestore.FieldValue.increment(-totalAmount),
                     updatedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -329,28 +408,43 @@ class WalletService {
                 this.invalidateWalletCache(sellerId)
             ]);
 
+            console.log(`✅ Escrow released for order: ${orderId}`);
             return { success: true };
         } catch (error) {
-            console.error('Release escrow error:', error);
+            console.error('❌ Release escrow error:', error);
             throw error;
         }
     }
 
     /**
-     * FIX: Refund escrow on cancellation.
+     * ✅ FIREBASE ATOMIC TRANSACTION: Refund escrow on cancellation
      */
     async refundEscrow(orderId, buyerId, sellerId, totalAmount, commission, reason) {
         try {
             const buyerRef = db.collection('wallets').doc(buyerId);
             const sellerRef = db.collection('wallets').doc(sellerId);
 
+            // FIREBASE ATOMIC TRANSACTION
             await db.runTransaction(async (transaction) => {
+                // Refund buyer
+                const buyerTxnRef = buyerRef.collection('transactions').doc();
+                transaction.set(buyerTxnRef, {
+                    id: buyerTxnRef.id,
+                    type: 'credit',
+                    amount: totalAmount,
+                    description: `Order #${orderId.slice(-6)} - Refund: ${reason}`,
+                    timestamp: Date.now(),
+                    status: 'completed',
+                    metadata: { orderId, reason }
+                });
+
                 transaction.update(buyerRef, {
                     balance: admin.firestore.FieldValue.increment(totalAmount),
                     pendingBalance: admin.firestore.FieldValue.increment(-totalAmount),
                     updatedAt: admin.firestore.FieldValue.serverTimestamp()
                 });
 
+                // Remove from seller's pending
                 transaction.update(sellerRef, {
                     pendingBalance: admin.firestore.FieldValue.increment(-(totalAmount - commission)),
                     updatedAt: admin.firestore.FieldValue.serverTimestamp()
@@ -362,9 +456,10 @@ class WalletService {
                 this.invalidateWalletCache(sellerId)
             ]);
 
+            console.log(`✅ Escrow refunded for order: ${orderId}`);
             return { success: true };
         } catch (error) {
-            console.error('Refund escrow error:', error);
+            console.error('❌ Refund escrow error:', error);
             throw error;
         }
     }
