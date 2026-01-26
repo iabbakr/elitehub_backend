@@ -23,6 +23,10 @@ const  paymentRoutes = require('./src/routes/payment.routes');
 
 const app = express();
 
+origin: process.env.NODE_ENV === 'production' 
+  ? ['https://elitehubng.com']
+  : ['http://localhost:8081', 'http://192.168.100.142:8081', '*'], // Add the '*' temporarily to test
+
 // Security Middleware
 app.use(helmet({
   contentSecurityPolicy: {
@@ -98,9 +102,12 @@ app.use((req, res, next) => {
 });
 
 // Health check route (no rate limit)
-app.get('/health', async (req, res) => {
+// Change from app.get('/health') to:
+app.get('/api/v1/health', async (req, res) => {
   try {
-    const redisHealthy = require('./src/config/redis').client.isOpen;
+    const { client } = require('./src/config/redis');
+    // client.isReady is the most accurate check for "Green" status
+    const redisHealthy = client.isOpen && client.isReady; 
     let firebaseHealthy = false;
     
     try {
@@ -121,10 +128,7 @@ app.get('/health', async (req, res) => {
       }
     });
   } catch (error) {
-    res.status(503).json({
-      status: 'unhealthy',
-      error: error.message
-    });
+    res.status(503).json({ status: 'unhealthy', error: error.message });
   }
 });
 
