@@ -6,10 +6,16 @@ const rateLimit = require('express-rate-limit');
 const compression = require('compression');
 const { connectRedis } = require('./src/config/redis');
 const { db } = require('./src/config/firebase');
-require('./src/jobs/orderCleanup');
+const { client: redisClient } = require('./src/config/redis');
 // In server.js
+
+// Background Jobs
 require('./src/jobs/orderCleanup');
-require('./src/jobs/keepAlive'); // Add this line
+require('./src/jobs/keepAlive');
+
+
+const maintenanceGuard = require('./src/middleware/maintenance');
+
 
 // Route Imports
 const walletRoutes = require('./src/routes/wallet.routes');
@@ -22,10 +28,6 @@ const billRoutes = require('./src/routes/bill.routes');
 const  paymentRoutes = require('./src/routes/payment.routes');
 
 const app = express();
-
-origin: process.env.NODE_ENV === 'production' 
-  ? ['https://elitehubng.com']
-  : ['http://localhost:8081', 'http://192.168.100.142:8081', '*'], // Add the '*' temporarily to test
 
 // Security Middleware
 app.use(helmet({
@@ -72,6 +74,7 @@ app.use(express.json({
 
 // Body parsers
 app.use(express.json({ limit: '10mb' }));
+app.use(maintenanceGuard); // 🛡️ Register the guard here
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Rate limiting (global)

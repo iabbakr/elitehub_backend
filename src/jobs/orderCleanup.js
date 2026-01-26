@@ -1,5 +1,6 @@
 const cron = require('node-cron');
-const { db, runTransaction, sendPushNotification } = require('../config/firebase'); // Corrected imports
+const { db, runTransaction } = require('../config/firebase'); // Raw DB access
+const firebaseService = require('../services/firebase.service'); // EliteHub Logic
 const walletService = require('../services/wallet.service');
 const { client } = require('../config/redis');
 
@@ -55,25 +56,22 @@ cron.schedule('0 * * * *', async () => {
                         ? "🚨 Your account has been suspended due to repeated inactivity."
                         : `⚠️ Warning: You have ${currentStrikes}/${SUSPENSION_THRESHOLD} strikes for unacknowledged orders.`;
                     
-                    // Use the corrected helper name
-                    await sendPushNotification(order.sellerId, "Shop Update", sellerMsg, { screen: "SellerDashboard" });
+                    // ✅ Triggered via the new Service layer
+                    await firebaseService.sendPushToUser(order.sellerId, "Shop Update", sellerMsg, { screen: "SellerDashboard" });
                 });
 
                 // 3. Process Refund
                 await walletService.refundEscrow(
-                    orderId,
-                    order.buyerId,
-                    order.sellerId,
-                    order.totalAmount,
-                    order.commission,
+                    orderId, order.buyerId, order.sellerId, 
+                    order.totalAmount, order.commission, 
                     'Seller inactivity refund'
                 );
 
                 // 4. Notify Buyer
-                await sendPushNotification(
+                await firebaseService.sendPushToUser(
                     order.buyerId,
                     "💸 Refund Processed",
-                    `Order #${orderId.slice(-6).toUpperCase()} was cancelled. Funds returned to wallet.`,
+                    `Order #${orderId.slice(-6).toUpperCase()} was cancelled. Funds returned.`,
                     { screen: "WalletTab" }
                 );
 
