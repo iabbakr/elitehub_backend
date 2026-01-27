@@ -338,41 +338,51 @@ class WalletService {
     /**
      * ✅ FIREBASE ATOMIC TRANSACTION: Release escrow on delivery
      */
-    async releaseEscrow(orderId, buyerId, sellerId, totalAmount, commission) {
-        try {
-            const sellerRef = db.collection('wallets').doc(sellerId);
-            const buyerRef = db.collection('wallets').doc(buyerId);
-            const orderRef = db.collection('orders').doc(orderId); // ✅ ADD THIS
+    // services/wallet.service.js
 
-            await db.runTransaction(async (transaction) => {
-                const sellerAmount = totalAmount - commission;
+async releaseEscrow(orderId, buyerId, sellerId, totalAmount, commission) {
+    try {
+        const sellerRef = db.collection('wallets').doc(sellerId);
+        const buyerRef = db.collection('wallets').doc(buyerId);
+        const orderRef = db.collection('orders').doc(orderId);
 
-                const sellerTxnRef = sellerRef.collection('transactions').doc();
-                transaction.update(orderRef, {
+        return await db.runTransaction(async (transaction) => {
+            const orderDoc = await transaction.get(orderRef);
+            
+            // GUARD: If order is already delivered, stop the transaction!
+            if (orderDoc.data().status === 'delivered') {
+                throw new Error("Order already completed and paid.");
+            }
+
+            const sellerAmount = totalAmount - commission;
+
+            // 1. Update Order Status (Inside the same lock)
+            transaction.update(orderRef, {
                 status: 'delivered',
                 buyerConfirmed: true,
                 updatedAt: admin.firestore.FieldValue.serverTimestamp()
             });
 
-                transaction.update(sellerRef, {
-                    balance: admin.firestore.FieldValue.increment(sellerAmount),
-                    pendingBalance: admin.firestore.FieldValue.increment(-sellerAmount),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                transaction.update(buyerRef, {
-                    pendingBalance: admin.firestore.FieldValue.increment(-totalAmount),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
+            // 2. Release Money to Seller
+            transaction.update(sellerRef, {
+                balance: admin.firestore.FieldValue.increment(sellerAmount),
+                pendingBalance: admin.firestore.FieldValue.increment(-sellerAmount),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
             });
 
-            await Promise.all([this.invalidateWalletCache(buyerId), this.invalidateWalletCache(sellerId)]);
+            // 3. Clear Escrow from Buyer
+            transaction.update(buyerRef, {
+                pendingBalance: admin.firestore.FieldValue.increment(-totalAmount),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
             return { success: true };
-        } catch (error) {
-            console.error('❌ Release escrow error:', error);
-            throw error;
-        }
+        });
+    } catch (error) {
+        console.error('❌ Release escrow error:', error);
+        throw error;
     }
+}
 
     /**
      * ✅ FIREBASE ATOMIC TRANSACTION: Refund escrow on cancellation
