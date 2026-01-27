@@ -2,29 +2,46 @@ const cron = require('node-cron');
 const axios = require('axios');
 const { client } = require('../config/redis');
 
-// Run every 10 minutes
 cron.schedule('*/10 * * * *', async () => {
-    console.log('--- System Keep-Alive Triggered ---');
+    const startTime = Date.now();
+    const timestamp = new Date().toISOString();
+    
+    console.log(`\n--- ⏳ System Keep-Alive Started [${timestamp}] ---`);
 
     try {
-        // 1. Keep Backend Awake: Ping the health check endpoint
-        // Use your production URL here
+        // 1. Backend Ping with correct path
         const APP_URL = process.env.NODE_ENV === 'production' 
-            ? 'https://elitehubng.com/health' 
-            : `http://localhost:${process.env.PORT || 3000}/health`;
+            ? 'https://elitehubng.com/api/v1/health' 
+            : `http://localhost:${process.env.PORT || 3000}/api/v1/health`;
 
         const response = await axios.get(APP_URL);
-        console.log(`📡 Backend Ping: ${response.status === 200 ? 'SUCCESS' : 'FAILED'}`);
+        const duration = Date.now() - startTime;
 
-        // 2. Keep Redis Awake: Small write/read operation
-        // This prevents the connection from being closed due to inactivity
+        console.log(`📡 Backend Status: ${response.status} (${duration}ms)`);
+
+        // 2. Redis Pulse Check
         if (client.isOpen) {
-            await client.set('heartbeat', Date.now());
-            const ping = await client.get('heartbeat');
-            console.log(`🚀 Redis Heartbeat: ${ping ? 'ACTIVE' : 'INACTIVE'}`);
+            // Store detailed heartbeat data in Redis
+            const heartbeatData = JSON.stringify({
+                lastRun: timestamp,
+                status: 'healthy',
+                responseTime: duration
+            });
+            
+            await client.set('system:heartbeat', heartbeatData);
+            console.log(`🚀 Redis Status: Verified & Updated`);
         }
 
     } catch (error) {
-        console.error('❌ Keep-Alive Error:', error.message);
+        console.error(`❌ Keep-Alive Failed: ${error.message}`);
+        
+        // Log failure to Redis if possible so you can alert on it later
+        if (client.isOpen) {
+            await client.set('system:heartbeat:error', JSON.stringify({
+                time: timestamp,
+                error: error.message
+            }));
+        }
     }
+    console.log(`--- ✅ Keep-Alive Cycle Complete ---\n`);
 });

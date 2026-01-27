@@ -342,20 +342,17 @@ class WalletService {
         try {
             const sellerRef = db.collection('wallets').doc(sellerId);
             const buyerRef = db.collection('wallets').doc(buyerId);
+            const orderRef = db.collection('orders').doc(orderId); // ✅ ADD THIS
 
             await db.runTransaction(async (transaction) => {
                 const sellerAmount = totalAmount - commission;
 
                 const sellerTxnRef = sellerRef.collection('transactions').doc();
-                transaction.set(sellerTxnRef, {
-                    id: sellerTxnRef.id,
-                    type: 'credit',
-                    amount: sellerAmount,
-                    description: `Order #${orderId.slice(-6)} - Payment Released`,
-                    timestamp: Date.now(),
-                    status: 'completed',
-                    metadata: { orderId, commission }
-                });
+                transaction.update(orderRef, {
+                status: 'delivered',
+                buyerConfirmed: true,
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
 
                 transaction.update(sellerRef, {
                     balance: admin.firestore.FieldValue.increment(sellerAmount),

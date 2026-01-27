@@ -172,6 +172,7 @@ router.put('/:orderId/confirm-delivery', authenticate, async (req, res) => {
 
         // 🔔 Alert Seller
         await firebaseService.sendPushToUser(order.sellerId, "💸 Funds Released", `Payment for #${orderId.slice(-6).toUpperCase()} is now in your balance.`);
+        await client.del(lockKey);
 
         await Promise.all([client.del(`order:${orderId}`), client.del(`orders:${order.buyerId}:all:all`), client.del(`orders:${order.sellerId}:all:all`)]);
         res.json({ success: true, message: 'Payment released' });
