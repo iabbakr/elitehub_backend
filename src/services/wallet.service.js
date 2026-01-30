@@ -1,6 +1,8 @@
 // src/services/wallet.service.js - FIREBASE AS SOURCE OF TRUTH
 const { db, admin } = require('../config/firebase');
 const { client } = require('../config/redis');
+const emailService = require('../services/emailService');
+const paystackService = require('../services/paystack.service');
 
 class WalletService {
     /**
@@ -246,6 +248,104 @@ class WalletService {
         } catch (error) {
             console.error('❌ Get balance error:', error);
             return 0;
+        }
+    }
+
+    /**
+     * ✅ ATOMIC WITHDRAWAL INITIALIZATION
+     * Deducts balance and prepares the Paystack transfer
+     */
+    async initializeWithdrawal(userId, userEmail, userName, payload) {
+        const { amountKobo, accountNumber, bankCode, accountName } = payload;
+        const amountNaira = amountKobo / 100;
+        const reference = `wd_${Date.now()}_${userId.slice(0, 5)}`;
+        const lockKey = `withdraw:lock:${reference}`;
+
+        try {
+            // 🛡️ Security Check: Ensure wallet isn't locked
+            await this._verifyWalletStatus(userId);
+
+            // 1️⃣ START FIREBASE TRANSACTION
+            const result = await db.runTransaction(async (transaction) => {
+                const walletRef = db.collection('wallets').doc(userId);
+                const userRef = db.collection('users').doc(userId);
+                const txnRef = db.collection('transactions').doc(`txn_${reference}`);
+
+                const [walletSnap, userSnap] = await Promise.all([
+                    transaction.get(walletRef),
+                    transaction.get(userRef)
+                ]);
+
+                if (!walletSnap.exists) throw new Error('Wallet not found');
+                const wallet = walletSnap.data();
+
+                // 2️⃣ BALANCE CHECK
+                if (wallet.balance < amountNaira) {
+                    throw new Error('Insufficient balance');
+                }
+
+                const userData = userSnap.data();
+                if (!userData.paystackRecipientCode) {
+                    throw new Error('Bank recipient not found. Please link your bank account again.');
+                }
+
+                // 3️⃣ LEDGER RECORD (Auditable)
+                transaction.set(txnRef, {
+                    id: reference,
+                    userId,
+                    type: 'debit',
+                    amount: amountNaira,
+                    description: `Withdrawal to ${accountName} (${bankCode})`,
+                    status: 'processing',
+                    timestamp: Date.now(),
+                    metadata: { 
+                        withdrawal: true, 
+                        accountNumber, 
+                        bankCode, 
+                        accountName 
+                    }
+                });
+
+                // 4️⃣ DEDUCT BALANCE
+                transaction.update(walletRef, {
+                    balance: admin.firestore.FieldValue.increment(-amountNaira),
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+
+                return { recipientCode: userData.paystackRecipientCode };
+            });
+
+            // 5️⃣ INITIATE PAYSTACK TRANSFER
+            const transfer = await paystackService.initiateTransfer(
+                result.recipientCode,
+                amountNaira,
+                `EliteHub Payout: ${reference}`
+            );
+
+            // 6️⃣ LOCK IN REDIS & INVALIDATE CACHE
+            await client.setEx(lockKey, 86400, 'true');
+            await this.invalidateWalletCache(userId);
+
+            // 7️⃣ NON-BLOCKING NOTIFICATION
+            try {
+                await emailService.sendWithdrawalConfirmation(userEmail, userName, amountNaira, {
+                    accountName,
+                    bankName: "Verified Bank",
+                    accountNumber
+                });
+            } catch (err) {
+                console.warn('📧 Notification failed but withdrawal succeeded:', err.message);
+            }
+
+            return { 
+                success: true, 
+                reference: transfer.reference, 
+                amount: amountNaira 
+            };
+
+        } catch (error) {
+            console.error(`❌ Withdrawal Initialization Error for ${userId}:`, error.message);
+            throw error;
         }
     }
 
