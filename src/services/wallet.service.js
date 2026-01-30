@@ -1,9 +1,8 @@
 // src/services/wallet.service.js - FIREBASE AS SOURCE OF TRUTH
 const { db, admin } = require('../config/firebase');
 const { client } = require('../config/redis');
-const emailService = require('../services/emailService');
-const paystackService = require('../services/paystack.service');
-
+const emailService = require('./email.service');     // Added the dot
+const paystackService = require('./paystack.service'); // Ensure this matches too
 class WalletService {
     /**
      * ✅ SECURITY GATE: Internal helper
