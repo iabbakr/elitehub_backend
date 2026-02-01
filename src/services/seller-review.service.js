@@ -1,4 +1,3 @@
-// services/seller-review.service.js - SELLER REVIEW SERVICE
 const { db, admin } = require('../config/firebase');
 const { client } = require('../config/redis');
 
@@ -17,62 +16,45 @@ const CACHE_TTL = {
 
 class SellerReviewService {
     /**
-     * ✅ Submit seller review (linked to order)
+     * ✅ Submit seller review (Production Grade)
+     * Fixed: Lifetime average rating math
+     * Fixed: Automated counters
      */
     async submitSellerReview(sellerId, buyerId, orderId, buyerName, rating, comment) {
         const lockKey = `seller_review:lock:${orderId}:${buyerId}`;
 
         try {
-            // 1️⃣ Check if order exists and is delivered
+            // 1️⃣ Verify Order Status (Security Check)
             const orderDoc = await db.collection('orders').doc(orderId).get();
-            
-            if (!orderDoc.exists()) {
-                throw new Error('Order not found');
-            }
+            if (!orderDoc.exists()) throw new Error('Order not found');
 
             const order = orderDoc.data();
-
-            // Verify order belongs to this buyer and seller
-            if (order.buyerId !== buyerId) {
-                throw new Error('Unauthorized: This is not your order');
+            if (order.buyerId !== buyerId) throw new Error('Unauthorized');
+            if (order.sellerId !== sellerId) throw new Error('Seller mismatch');
+            if (order.status !== 'delivered') throw new Error('You can only review delivered orders');
+            
+            // Limit review window to 30 days post-delivery
+            const thirtyDays = 30 * 24 * 60 * 60 * 1000;
+            if (Date.now() - (order.deliveredAt || order.updatedAt) > thirtyDays) {
+                throw new Error('Review window for this order has expired (30 days limit)');
             }
 
-            if (order.sellerId !== sellerId) {
-                throw new Error('Seller mismatch');
-            }
-
-            // Only delivered orders can be reviewed
-            if (order.status !== 'delivered') {
-                throw new Error('Only delivered orders can be reviewed');
-            }
-
-            // 2️⃣ Check if already reviewed
-            const hasReviewed = await this.hasReviewedOrder(buyerId, sellerId, orderId);
-            if (hasReviewed) {
-                throw new Error('You have already reviewed this seller for this order');
-            }
-
-            // 3️⃣ Prevent duplicate submission (Redis lock)
+            // 2️⃣ Duplicate Submission Prevention
             const isLocked = await client.get(lockKey);
-            if (isLocked) {
-                throw new Error('Review submission in progress');
-            }
-            await client.setEx(lockKey, 60, 'processing');
+            if (isLocked) throw new Error('Processing review, please wait...');
+            await client.setEx(lockKey, 30, 'processing');
 
             const sellerRef = db.collection('users').doc(sellerId);
             const reviewsCol = db.collection('seller_reviews');
 
-            // 4️⃣ Atomic transaction
+            // 3️⃣ Atomic Transaction for Rating Consistency
             const result = await db.runTransaction(async (transaction) => {
                 const sellerDoc = await transaction.get(sellerRef);
-                
-                if (!sellerDoc.exists()) {
-                    throw new Error('Seller not found');
-                }
+                if (!sellerDoc.exists()) throw new Error('Seller not found');
 
                 const sellerData = sellerDoc.data();
-
-                // Get existing reviews (for sliding window - last 10)
+                
+                // Get current window reviews (for sliding window)
                 const existingReviewsSnap = await reviewsCol
                     .where('sellerId', '==', sellerId)
                     .orderBy('createdAt', 'desc')
@@ -80,23 +62,22 @@ class SellerReviewService {
 
                 const existingReviews = existingReviewsSnap.docs;
 
-                // 5️⃣ Sliding window: Delete oldest if at limit (10)
+                // Handle Sliding Window (Maintain max 10 UI reviews)
                 if (existingReviews.length >= 10) {
-                    const reviewsToDelete = existingReviews.slice(9);
-                    reviewsToDelete.forEach((reviewDoc) => {
-                        transaction.delete(reviewDoc.ref);
-                    });
+                    const toDelete = existingReviews.slice(9);
+                    toDelete.forEach(doc => transaction.delete(doc.ref));
                 }
 
-                // 6️⃣ Calculate new rating
-                const currentRating = sellerData.rating || 0;
-                const currentCount = sellerData.reviewCount || 0;
-                const activeWindowCount = Math.min(existingReviews.length + 1, 10);
-                const newRating = ((currentRating * Math.min(currentCount, 9)) + rating) / activeWindowCount;
+                // Correct Mathematical Rating (Lifetime Cumulative Average)
+                const oldTotalSum = sellerData.totalRatingSum || 0;
+                const oldTotalCount = sellerData.totalReviews || 0;
+                const newTotalSum = oldTotalSum + rating;
+                const newTotalCount = oldTotalCount + 1;
+                const globalAverage = parseFloat((newTotalSum / newTotalCount).toFixed(1));
 
-                // 7️⃣ Create new review
+                // Create Review Document
                 const newReviewRef = reviewsCol.doc();
-                const reviewData = {
+                transaction.set(newReviewRef, {
                     id: newReviewRef.id,
                     sellerId,
                     buyerId,
@@ -107,249 +88,132 @@ class SellerReviewService {
                     createdAt: Date.now(),
                     flagged: false,
                     flagCount: 0,
-                };
+                });
 
-                transaction.set(newReviewRef, reviewData);
-
-                // 8️⃣ Update order to mark as reviewed
+                // Update Order Status
                 transaction.update(db.collection('orders').doc(orderId), {
                     hasSellerReview: true,
                     reviewedAt: Date.now(),
                 });
 
-                // 9️⃣ Update seller stats
-                const updateData = {
-                    rating: parseFloat(newRating.toFixed(1)),
-                    reviewCount: activeWindowCount,
+                // Update Seller Profile Counters
+                transaction.update(sellerRef, {
+                    rating: globalAverage,
+                    totalRatingSum: admin.firestore.FieldValue.increment(rating),
                     totalReviews: admin.firestore.FieldValue.increment(1),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-                };
-
-                transaction.update(sellerRef, updateData);
-
-                return { reviewId: newReviewRef.id, newRating, activeWindowCount };
-            });
-
-            // 🔟 Cache and cleanup
-            await Promise.all([
-                client.setEx(CACHE_KEYS.REVIEW_CHECK(buyerId, sellerId, orderId), 86400 * 365, 'true'),
-                this._invalidateSellerCache(sellerId),
-            ]);
-
-            await client.del(lockKey);
-
-            return {
-                success: true,
-                reviewId: result.reviewId,
-                newRating: result.newRating,
-                reviewCount: result.activeWindowCount,
-            };
-        } catch (error) {
-            await client.del(lockKey);
-            throw error;
-        }
-    }
-
-    /**
-     * ✅ Get seller reviews (last 10) with caching
-     */
-    async getSellerReviews(sellerId, limit = 10) {
-        try {
-            // Try Redis cache first
-            const cacheKey = `${CACHE_KEYS.SELLER_REVIEWS(sellerId)}:${limit}`;
-            const cached = await client.get(cacheKey);
-            if (cached) {
-                return JSON.parse(cached);
-            }
-
-            // Fetch from Firestore
-            const reviewsSnap = await db.collection('seller_reviews')
-                .where('sellerId', '==', sellerId)
-                .orderBy('createdAt', 'desc')
-                .limit(limit)
-                .get();
-
-            const reviews = reviewsSnap.docs.map(doc => ({
-                id: doc.id,
-                ...doc.data(),
-                date: new Date(doc.data().createdAt).toLocaleDateString()
-            }));
-
-            // Cache for 5 minutes
-            await client.setEx(cacheKey, CACHE_TTL.REVIEWS, JSON.stringify(reviews));
-
-            return reviews;
-        } catch (error) {
-            console.error('Get seller reviews error:', error);
-            return [];
-        }
-    }
-
-    /**
-     * ✅ Get seller rating with counter
-     */
-    async getSellerRating(sellerId) {
-        try {
-            const sellerDoc = await db.collection('users').doc(sellerId).get();
-            
-            if (!sellerDoc.exists()) {
-                return { rating: 0, reviewCount: 0, totalReviews: 0 };
-            }
-
-            const data = sellerDoc.data();
-            return {
-                rating: data.rating || 0,
-                reviewCount: data.reviewCount || 0, // Active window (max 10)
-                totalReviews: data.totalReviews || 0, // All-time counter
-            };
-        } catch (error) {
-            console.error('Get seller rating error:', error);
-            return { rating: 0, reviewCount: 0, totalReviews: 0 };
-        }
-    }
-
-    /**
-     * ✅ Get comprehensive seller statistics
-     */
-    async getSellerStats(sellerId) {
-        try {
-            // Try cache first
-            const cached = await client.get(CACHE_KEYS.SELLER_STATS(sellerId));
-            if (cached) {
-                return JSON.parse(cached);
-            }
-
-            const [sellerDoc, productsSnap, ordersSnap] = await Promise.all([
-                db.collection('users').doc(sellerId).get(),
-                db.collection('products').where('sellerId', '==', sellerId).get(),
-                db.collection('orders')
-                    .where('sellerId', '==', sellerId)
-                    .where('status', '==', 'delivered')
-                    .get()
-            ]);
-
-            if (!sellerDoc.exists()) {
-                throw new Error('Seller not found');
-            }
-
-            const sellerData = sellerDoc.data();
-            const totalProducts = productsSnap.docs.length;
-            const deliveredOrders = ordersSnap.docs;
-            
-            // Calculate total items sold
-            const totalItemsSold = deliveredOrders.reduce((sum, doc) => {
-                const order = doc.data();
-                const itemCount = order.products.reduce((acc, item) => acc + item.quantity, 0);
-                return sum + itemCount;
-            }, 0);
-
-            // Get categories
-            const categories = sellerData.sellerCategories || [];
-
-            const stats = {
-                businessName: sellerData.businessName || sellerData.name,
-                businessAddress: sellerData.businessAddress,
-                rating: sellerData.rating || 0,
-                reviewCount: sellerData.reviewCount || 0,
-                totalReviews: sellerData.totalReviews || 0,
-                totalProducts,
-                totalItemsSold,
-                categories,
-                memberSince: sellerData.createdAt,
-                imageUrl: sellerData.imageUrl || null,
-            };
-
-            // Cache for 10 minutes
-            await client.setEx(CACHE_KEYS.SELLER_STATS(sellerId), CACHE_TTL.STATS, JSON.stringify(stats));
-
-            return stats;
-        } catch (error) {
-            console.error('Get seller stats error:', error);
-            throw error;
-        }
-    }
-
-    /**
-     * ✅ Check if buyer has reviewed this seller for this order
-     */
-    async hasReviewedOrder(buyerId, sellerId, orderId) {
-        // Check Redis first
-        const cached = await client.get(CACHE_KEYS.REVIEW_CHECK(buyerId, sellerId, orderId));
-        if (cached) return true;
-
-        // Check Firestore
-        const reviewSnap = await db.collection('seller_reviews')
-            .where('buyerId', '==', buyerId)
-            .where('sellerId', '==', sellerId)
-            .where('orderId', '==', orderId)
-            .limit(1)
-            .get();
-
-        const hasReviewed = !reviewSnap.empty;
-
-        if (hasReviewed) {
-            // Cache for 1 year
-            await client.setEx(
-                CACHE_KEYS.REVIEW_CHECK(buyerId, sellerId, orderId),
-                86400 * 365,
-                'true'
-            );
-        }
-
-        return hasReviewed;
-    }
-
-    /**
-     * ✅ Flag review
-     */
-    async flagReview(reviewId, reportedBy, reason) {
-        try {
-            const reviewRef = db.collection('seller_reviews').doc(reviewId);
-
-            await db.runTransaction(async (transaction) => {
-                const reviewDoc = await transaction.get(reviewRef);
-                
-                if (!reviewDoc.exists()) {
-                    throw new Error('Review not found');
-                }
-
-                const reviewData = reviewDoc.data();
-                const flagCount = (reviewData.flagCount || 0) + 1;
-
-                transaction.update(reviewRef, {
-                    flagged: true,
-                    flagCount,
-                    flags: admin.firestore.FieldValue.arrayUnion({
-                        reportedBy,
-                        reason,
-                        timestamp: Date.now(),
-                    }),
+                    reviewCount: Math.min(existingReviews.length + 1, 10), // UI Window count
                     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
                 });
+
+                return { reviewId: newReviewRef.id, globalAverage };
             });
 
-            return { success: true };
+            // 4️⃣ Cleanup & Invalidation
+            await Promise.all([
+                client.setEx(CACHE_KEYS.REVIEW_CHECK(buyerId, sellerId, orderId), 86400 * 30, 'true'),
+                this._invalidateSellerCache(sellerId),
+                client.del(lockKey)
+            ]);
+
+            return result;
         } catch (error) {
-            console.error('Flag review error:', error);
+            await client.del(lockKey);
             throw error;
         }
     }
 
     /**
-     * Invalidate all seller-related caches
+     * ✅ Toggle Seller Follow with Atomic Counter
      */
-    async _invalidateSellerCache(sellerId) {
-        const pattern = `seller_reviews:${sellerId}*`;
-        const keys = await client.keys(pattern);
-        
-        if (keys.length > 0) {
-            await client.del(keys);
-        }
+    async toggleFollowSeller(userId, sellerId, action = 'follow') {
+        const followRef = db.collection('seller_followers').doc(`${userId}_${sellerId}`);
+        const sellerRef = db.collection('users').doc(sellerId);
+        const userRef = db.collection('users').doc(userId);
 
-        await Promise.all([
-            client.del(CACHE_KEYS.SELLER_RATING(sellerId)),
-            client.del(CACHE_KEYS.SELLER_STATS(sellerId)),
-        ]);
+        await db.runTransaction(async (transaction) => {
+            const followDoc = await transaction.get(followRef);
+
+            if (action === 'follow') {
+                if (followDoc.exists()) return; // Already following
+                transaction.set(followRef, { userId, sellerId, createdAt: Date.now() });
+                transaction.update(sellerRef, { followerCount: admin.firestore.FieldValue.increment(1) });
+                transaction.update(userRef, { favoriteProviders: admin.firestore.FieldValue.arrayUnion(sellerId) });
+            } else {
+                if (!followDoc.exists()) return; // Not following
+                transaction.delete(followRef);
+                transaction.update(sellerRef, { followerCount: admin.firestore.FieldValue.increment(-1) });
+                transaction.update(userRef, { favoriteProviders: admin.firestore.FieldValue.arrayUnion(sellerId) });
+            }
+        });
+
+        await this._invalidateSellerCache(sellerId);
+    }
+
+    /**
+     * ✅ Get Seller Stats (High Speed via Redis)
+     */
+    async getSellerStats(sellerId) {
+        const cacheKey = CACHE_KEYS.SELLER_STATS(sellerId);
+        const cached = await client.get(cacheKey);
+        if (cached) return JSON.parse(cached);
+
+        const sellerDoc = await db.collection('users').doc(sellerId).get();
+        if (!sellerDoc.exists()) throw new Error('Seller not found');
+        
+        const data = sellerDoc.data();
+
+        // Count products (Limited query for cost)
+        const productsSnap = await db.collection('products')
+            .where('sellerId', '==', sellerId)
+            .count()
+            .get();
+
+        const stats = {
+            businessName: data.businessName || data.name,
+            imageUrl: data.imageUrl || null,
+            rating: data.rating || 0,
+            totalReviews: data.totalReviews || 0,
+            followerCount: data.followerCount || 0,
+            profileViews: data.profileViews || 0,
+            totalProducts: productsSnap.data().count,
+            memberSince: data.createdAt,
+            isVerified: data.isVerified || false
+        };
+
+        await client.setEx(cacheKey, CACHE_TTL.STATS, JSON.stringify(stats));
+        return stats;
+    }
+
+    /**
+     * ✅ Track Profile View (Fire and Forget)
+     */
+    async trackView(sellerId) {
+        // We don't use a transaction here to maximize speed and minimize write costs
+        await db.collection('users').doc(sellerId).update({
+            profileViews: admin.firestore.FieldValue.increment(1)
+        });
+        await client.del(CACHE_KEYS.SELLER_STATS(sellerId));
+    }
+
+    async getSellerReviews(sellerId, limit = 10) {
+        const cacheKey = `${CACHE_KEYS.SELLER_REVIEWS(sellerId)}:${limit}`;
+        const cached = await client.get(cacheKey);
+        if (cached) return JSON.parse(cached);
+
+        const snap = await db.collection('seller_reviews')
+            .where('sellerId', '==', sellerId)
+            .orderBy('createdAt', 'desc')
+            .limit(limit)
+            .get();
+
+        const reviews = snap.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+        await client.setEx(cacheKey, CACHE_TTL.REVIEWS, JSON.stringify(reviews));
+        return reviews;
+    }
+
+    async _invalidateSellerCache(sellerId) {
+        const keys = await client.keys(`*${sellerId}*`);
+        if (keys.length > 0) await client.del(keys);
     }
 }
 
