@@ -7,18 +7,15 @@ const compression = require('compression');
 const { connectRedis } = require('./src/config/redis');
 const { db } = require('./src/config/firebase');
 const { client: redisClient } = require('./src/config/redis');
-// In server.js
+const sellerReviewRoutes = require('./src/routes/seller-review.routes');
 
 // Background Jobs
 require('./src/jobs/orderCleanup');
 require('./src/jobs/keepAlive');
 
-
 const maintenanceGuard = require('./src/middleware/maintenance');
 
-
 // Route Imports
-
 const walletRoutes = require('./src/routes/wallet.routes');
 const webhookRoutes = require('./src/routes/webhook.routes');
 const uploadRoutes = require('./src/routes/upload.routes');
@@ -26,7 +23,7 @@ const userRoutes = require('./src/routes/user.routes');
 const productRoutes = require('./src/routes/product.routes');
 const orderRoutes = require('./src/routes/order.routes');
 const billRoutes = require('./src/routes/bill.routes');
-const  paymentRoutes = require('./src/routes/payment.routes');
+const paymentRoutes = require('./src/routes/payment.routes');
 
 const app = express();
 
@@ -52,7 +49,7 @@ app.use(cors({
     ? ['https://elitehubng.com', 'https://www.elitehubng.com']
     : [
         'http://localhost:8081', 
-        'http://192.168.100.142:8081', // Your machine's Local IP
+        'http://192.168.100.142:8081',
         '*' 
       ],
   credentials: true,
@@ -63,10 +60,9 @@ app.use(cors({
 // Compression for responses
 app.use(compression());
 
-// In server.js (Place this ABOVE your global app.use(express.json()))
+// Webhook raw body handler
 app.use(express.json({
   verify: (req, res, buf) => {
-    // Only capture rawBody for paystack webhook path to save memory
     if (req.originalUrl.includes('webhooks/paystack')) {
       req.rawBody = buf;
     }
@@ -75,13 +71,13 @@ app.use(express.json({
 
 // Body parsers
 app.use(express.json({ limit: '10mb' }));
-app.use(maintenanceGuard); // 🛡️ Register the guard here
+app.use(maintenanceGuard);
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Rate limiting (global)
 const globalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // 100 requests per window
+  windowMs: 15 * 60 * 1000,
+  max: 100,
   message: 'Too many requests, please try again later',
   standardHeaders: true,
   legacyHeaders: false,
@@ -105,13 +101,10 @@ app.use((req, res, next) => {
   next();
 });
 
-
-// Health check route (no rate limit)
-// Change from app.get('/health') to:
+// Health check route
 app.get('/api/v1/health', async (req, res) => {
   try {
     const { client } = require('./src/config/redis');
-    // client.isReady is the most accurate check for "Green" status
     const redisHealthy = client.isOpen && client.isReady; 
     let firebaseHealthy = false;
     
@@ -146,6 +139,7 @@ app.use('/api/v1/products', productRoutes);
 app.use('/api/v1/orders', orderRoutes);
 app.use('/api/v1/bills', billRoutes);
 app.use('/api/v1/payments', paymentRoutes);
+app.use('/api/v1/seller-reviews', sellerReviewRoutes);
 
 // 404 Handler
 app.use('*', (req, res) => {
@@ -189,7 +183,7 @@ async function initializeApp() {
     app.listen(PORT, () => {
       console.log(`🚀 EliteHub API running on port ${PORT}`);
       console.log(`📡 Local Network Access: http://192.168.100.142:${PORT}`);
-  console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
+      console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
     });
   } catch (error) {
     console.error('❌ Failed to initialize app:', error);
