@@ -3,7 +3,7 @@ const router = express.Router();
 const { authenticate, adminOnly } = require('../middleware/auth');
 const { db, runTransaction, getDocument } = require('../config/firebase');
 const walletService = require('../services/wallet.service');
-const firebaseService = require('../services/firebase.service');
+const pushNotificationService = require('../services/push-notification.service'); // ✅ FIXED: Import correct service
 const { client, CACHE_KEYS } = require('../config/redis');
 
 /**
@@ -331,7 +331,7 @@ router.post('/', authenticate, async (req, res) => {
         );
 
         // 🔔 Notify seller
-        await firebaseService.sendPushToUser(
+        await pushNotificationService.sendPushToUser(
             sellerId,
             "New Order Received! 🎉",
             `Order #${orderId.slice(-6).toUpperCase()} worth ₦${totalAmount.toLocaleString()}`,
@@ -425,7 +425,7 @@ router.put('/:orderId/tracking', authenticate, async (req, res) => {
             ready_for_pickup: 'Your order is ready for pickup/delivery confirmation'
         };
 
-        await firebaseService.sendPushToUser(
+        await pushNotificationService.sendPushToUser(
             order.buyerId,
             "📦 Order Update",
             statusMessages[status],
@@ -531,7 +531,7 @@ router.put('/:orderId/cancel-buyer', authenticate, async (req, res) => {
         );
 
         // 🔔 Notify seller
-        await firebaseService.sendPushToUser(
+        await pushNotificationService.sendPushToUser(
             order.sellerId,
             "Order Cancelled by Buyer",
             `Order #${orderId.slice(-6)} was cancelled before confirmation`,
@@ -629,7 +629,7 @@ router.put('/:orderId/cancel-seller', authenticate, async (req, res) => {
         );
 
         // 🔔 Notify buyer
-        await firebaseService.sendPushToUser(
+        await pushNotificationService.sendPushToUser(
             order.buyerId,
             "Order Cancelled by Seller",
             "Full refund has been credited to your wallet",
@@ -720,7 +720,7 @@ router.put('/:orderId/confirm-delivery', authenticate, async (req, res) => {
         }
 
         // 🔔 Notify seller
-        await firebaseService.sendPushToUser(
+        await pushNotificationService.sendPushToUser(
             order.sellerId,
             "💸 Payment Released",
             `₦${(order.totalAmount - order.commission).toLocaleString()} credited to your wallet`,
@@ -808,7 +808,7 @@ router.post('/admin/pardon-seller/:userId', authenticate, adminOnly, async (req,
         
         await client.del(`user:${userId}:profile`);
         
-        await firebaseService.sendPushToUser(
+        await pushNotificationService.sendPushToUser(
             userId, 
             "Shop Reinstated", 
             "Your account is healthy again."
@@ -825,11 +825,8 @@ router.post('/admin/system/maintenance', authenticate, adminOnly, async (req, re
     
     await client.set('system:maintenance_mode', enabled ? 'true' : 'false');
     
-    await firebaseService.broadcastAdminAlert(
-        "MAINTENANCE_TOGGLED",
-        `Platform maintenance was ${enabled ? 'ENABLED' : 'DISABLED'} by Admin.`,
-        enabled ? 'high' : 'info'
-    );
+    // Log maintenance toggle
+    console.log(`🔧 Maintenance mode ${enabled ? 'ENABLED' : 'DISABLED'}`);
 
     res.json({ success: true, enabled });
 });
