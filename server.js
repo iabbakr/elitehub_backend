@@ -6,13 +6,12 @@ const rateLimit = require('express-rate-limit');
 const compression = require('compression');
 const { connectRedis } = require('./src/config/redis');
 const { db } = require('./src/config/firebase');
-const { client: redisClient } = require('./src/config/redis');
-const sellerReviewRoutes = require('./src/routes/seller-review.routes');
 
 // Background Jobs
 require('./src/jobs/orderCleanup');
 require('./src/jobs/keepAlive');
 
+// Middleware Imports
 const maintenanceGuard = require('./src/middleware/maintenance');
 
 // Route Imports
@@ -24,15 +23,17 @@ const productRoutes = require('./src/routes/product.routes');
 const orderRoutes = require('./src/routes/order.routes');
 const billRoutes = require('./src/routes/bill.routes');
 const paymentRoutes = require('./src/routes/payment.routes');
+const sellerReviewRoutes = require('./src/routes/seller-review.routes');
 
 const app = express();
 
-// Security Middleware
+// --- 1. Security & Performance Middleware ---
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
       imgSrc: ["'self'", "data:", "https://res.cloudinary.com"],
+      connectSrc: ["'self'", "https://res.cloudinary.com", "https://api.paystack.co"],
       scriptSrc: ["'self'"],
     }
   },
@@ -43,25 +44,42 @@ app.use(helmet({
   }
 }));
 
-// CORS Configuration
 app.use(cors({
   origin: process.env.NODE_ENV === 'production' 
     ? ['https://elitehubng.com', 'https://www.elitehubng.com']
-    : [
-        'http://localhost:8081', 
-        'http://192.168.100.142:8081',
-        '*' 
-      ],
+    : ['http://localhost:8081', 'http://192.168.100.142:8081', '*'],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
   allowedHeaders: ['Content-Type', 'Authorization', 'x-cache']
 }));
 
-// Compression for responses
 app.use(compression());
 
-// Webhook raw body handler
+// --- 2. Rate Limiter Definitions ---
+const globalLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100,
+  message: 'Too many requests, please try again later',
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+
+const emailLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: 10,
+  message: 'Too many emails sent from this IP, please try again later'
+});
+
+const strictLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  message: 'Too many attempts, please try again later'
+});
+
+// --- 3. Body Parsers & Request Handling ---
+// IMPORTANT: Single body parser instance handles both JSON and Paystack rawBody
 app.use(express.json({
+  limit: '10mb',
   verify: (req, res, buf) => {
     if (req.originalUrl.includes('webhooks/paystack')) {
       req.rawBody = buf;
@@ -69,29 +87,16 @@ app.use(express.json({
   }
 }));
 
-// Body parsers
-app.use(express.json({ limit: '10mb' }));
-app.use(maintenanceGuard);
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
-// Rate limiting (global)
-const globalLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 100,
-  message: 'Too many requests, please try again later',
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+// --- 4. Custom Middleware Application ---
+app.use(maintenanceGuard);
+
+// Apply limiters to specific paths before the global /api/ limiter
+app.use('/api/v1/users/welcome', emailLimiter);
 app.use('/api/', globalLimiter);
 
-// Strict rate limiting for sensitive endpoints
-const strictLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
-  message: 'Too many attempts, please try again later'
-});
-
-// Request logging middleware
+// Request logging
 app.use((req, res, next) => {
   const start = Date.now();
   res.on('finish', () => {
@@ -101,7 +106,7 @@ app.use((req, res, next) => {
   next();
 });
 
-// Health check route
+// --- 5. Health Check ---
 app.get('/api/v1/health', async (req, res) => {
   try {
     const { client } = require('./src/config/redis');
@@ -130,7 +135,7 @@ app.get('/api/v1/health', async (req, res) => {
   }
 });
 
-// API Routes
+// --- 6. API Routes ---
 app.use('/api/v1/wallet', walletRoutes);
 app.use('/api/v1/webhooks', webhookRoutes);
 app.use('/api/v1/upload', uploadRoutes);
@@ -141,22 +146,15 @@ app.use('/api/v1/bills', billRoutes);
 app.use('/api/v1/payments', paymentRoutes);
 app.use('/api/v1/seller-reviews', sellerReviewRoutes);
 
-// 404 Handler
+// --- 7. Error Handling ---
 app.use('*', (req, res) => {
-  res.status(404).json({
-    success: false,
-    message: 'Route not found'
-  });
+  res.status(404).json({ success: false, message: 'Route not found' });
 });
 
-// Global Error Handler
 app.use((err, req, res, next) => {
   console.error('Error:', err);
-  
   const statusCode = err.statusCode || 500;
-  const message = process.env.NODE_ENV === 'production' 
-    ? 'Internal server error' 
-    : err.message;
+  const message = process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message;
   
   res.status(statusCode).json({
     success: false,
@@ -165,24 +163,19 @@ app.use((err, req, res, next) => {
   });
 });
 
-// Initialize services
+// --- 8. Initialization & Shutdown ---
 async function initializeApp() {
   console.log('🛠️  Initializing EliteHub Backend Services...');
-  
   try {
-    // Connect Redis
     await connectRedis();
     console.log('✅ Redis: Connected successfully');
     
-    // Verify Firebase
     await db.collection('health_check').limit(1).get();
     console.log('✅ Firebase: Connected successfully');
     
-    // Start server
     const PORT = process.env.PORT || 3000;
     app.listen(PORT, () => {
       console.log(`🚀 EliteHub API running on port ${PORT}`);
-      console.log(`📡 Local Network Access: http://192.168.100.142:${PORT}`);
       console.log(`🌍 Environment: ${process.env.NODE_ENV || 'development'}`);
     });
   } catch (error) {
@@ -191,20 +184,15 @@ async function initializeApp() {
   }
 }
 
-// Graceful shutdown
-process.on('SIGTERM', async () => {
-  console.log('SIGTERM received, shutting down gracefully...');
+const gracefulShutdown = async (signal) => {
+  console.log(`${signal} received, shutting down gracefully...`);
   const { client } = require('./src/config/redis');
-  await client.quit();
+  if (client.isOpen) await client.quit();
   process.exit(0);
-});
+};
 
-process.on('SIGINT', async () => {
-  console.log('SIGINT received, shutting down gracefully...');
-  const { client } = require('./src/config/redis');
-  await client.quit();
-  process.exit(0);
-});
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
 initializeApp();
 
