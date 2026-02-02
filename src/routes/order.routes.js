@@ -749,6 +749,229 @@ router.put('/:orderId/confirm-delivery', authenticate, async (req, res) => {
     }
 });
 
+
+
+/**
+ * POST /api/v1/orders/bundle
+ * ✅ ATOMIC BUNDLE ORDER CREATION
+ * Creates multiple orders from a single cart atomically
+ */
+router.post('/bundle', authenticate, async (req, res) => {
+    const startTime = Date.now();
+    
+    try {
+        const { subOrders, phoneNumber } = req.body;
+        const buyerId = req.userId;
+
+        // Validation
+        if (!subOrders || !Array.isArray(subOrders) || subOrders.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'subOrders array is required'
+            });
+        }
+
+        console.log(`📦 Creating bundle order for buyer ${buyerId}`);
+        console.log(`   Sub-orders: ${subOrders.length}`);
+
+        // Import Firebase Admin
+        const { db, admin } = require('../config/firebase');
+        
+        const orderIds = [];
+        let totalCartAmount = 0;
+
+        await db.runTransaction(async (transaction) => {
+            // Phase 1: Collect all product refs
+            const allProductRefs = [];
+            for (const subOrder of subOrders) {
+                for (const item of subOrder.items) {
+                    allProductRefs.push(db.collection('products').doc(item.productId));
+                }
+            }
+
+            // Phase 2: Read all products
+            const productSnaps = await Promise.all(
+                allProductRefs.map(ref => transaction.get(ref))
+            );
+
+            const productMap = new Map();
+            productSnaps.forEach(snap => {
+                if (snap.exists) {
+                    productMap.set(snap.id, snap.data());
+                }
+            });
+
+            // Phase 3: Read wallets
+            const buyerWalletRef = db.collection('wallets').doc(buyerId);
+            const buyerWalletSnap = await transaction.get(buyerWalletRef);
+            
+            if (!buyerWalletSnap.exists) {
+                throw new Error('Buyer wallet not found');
+            }
+
+            const buyerWallet = buyerWalletSnap.data();
+            const stockUpdates = new Map();
+
+            // Phase 4: Process each sub-order
+            for (const subOrder of subOrders) {
+                const newOrderRef = db.collection('orders').doc();
+                const orderId = newOrderRef.id;
+                orderIds.push(orderId);
+
+                let subtotal = 0;
+
+                // Validate items and calculate subtotal
+                for (const item of subOrder.items) {
+                    const product = productMap.get(item.productId);
+                    
+                    if (!product) {
+                        throw new Error(`Product ${item.productName} not found`);
+                    }
+
+                    const currentRequested = stockUpdates.get(item.productId) || 0;
+                    const newRequested = currentRequested + item.quantity;
+
+                    if (product.stock < newRequested) {
+                        throw new Error(`Insufficient stock for ${product.name}`);
+                    }
+
+                    stockUpdates.set(item.productId, newRequested);
+
+                    const price = product.discount 
+                        ? product.price * (1 - product.discount / 100) 
+                        : product.price;
+                    
+                    subtotal += price * item.quantity;
+                }
+
+                const orderTotal = Math.round(subtotal - subOrder.discount + subOrder.deliveryFee);
+                const orderCommission = Math.round(orderTotal * 0.10);
+                totalCartAmount += orderTotal;
+
+                // Create order document
+                transaction.set(newOrderRef, {
+                    id: orderId,
+                    buyerId,
+                    sellerId: subOrder.sellerId,
+                    products: subOrder.items,
+                    totalAmount: orderTotal,
+                    commission: orderCommission,
+                    status: 'running',
+                    deliveryMethod: subOrder.deliveryMethod,
+                    deliveryFee: subOrder.deliveryFee,
+                    deliveryAddress: subOrder.deliveryAddress,
+                    phoneNumber: phoneNumber || null,
+                    buyerNote: subOrder.buyerNote || null,
+                    disputeStatus: 'none',
+                    createdAt: Date.now(),
+                    updatedAt: Date.now()
+                });
+
+                // Buyer payment transaction
+                const buyerTxnRef = db.collection(`wallets/${buyerId}/transactions`).doc(`pay_${orderId}`);
+                transaction.set(buyerTxnRef, {
+                    id: `pay_${orderId}`,
+                    userId: buyerId,
+                    type: 'debit',
+                    category: 'order_payment',
+                    amount: orderTotal,
+                    description: `Order #${orderId.slice(-6).toUpperCase()} - Escrow Hold`,
+                    status: 'pending',
+                    timestamp: Date.now(),
+                    metadata: { orderId }
+                });
+
+                // Seller pending transaction
+                const sellerTxnRef = db.collection(`wallets/${subOrder.sellerId}/transactions`).doc();
+                transaction.set(sellerTxnRef, {
+                    id: sellerTxnRef.id,
+                    userId: subOrder.sellerId,
+                    type: 'credit',
+                    category: 'order_payment',
+                    amount: orderTotal - orderCommission,
+                    description: `Order #${orderId.slice(-6).toUpperCase()} - Pending Delivery`,
+                    status: 'pending',
+                    timestamp: Date.now(),
+                    metadata: { orderId, commission: orderCommission }
+                });
+
+                // Update seller pending balance
+                const sellerWalletRef = db.collection('wallets').doc(subOrder.sellerId);
+                const sellerWalletSnap = await transaction.get(sellerWalletRef);
+                
+                if (sellerWalletSnap.exists()) {
+                    const sellerWallet = sellerWalletSnap.data();
+                    transaction.update(sellerWalletRef, {
+                        pendingBalance: (sellerWallet.pendingBalance || 0) + (orderTotal - orderCommission),
+                        updatedAt: Date.now()
+                    });
+                }
+            }
+
+            // Phase 5: Deduct from buyer balance
+            if (buyerWallet.balance < totalCartAmount) {
+                throw new Error('Insufficient balance');
+            }
+
+            transaction.update(buyerWalletRef, {
+                balance: buyerWallet.balance - totalCartAmount,
+                pendingBalance: (buyerWallet.pendingBalance || 0) + totalCartAmount,
+                updatedAt: Date.now()
+            });
+
+            // Phase 6: Update stock
+            stockUpdates.forEach((quantity, productId) => {
+                const productRef = db.collection('products').doc(productId);
+                const product = productMap.get(productId);
+                
+                transaction.update(productRef, {
+                    stock: product.stock - quantity,
+                    updatedAt: Date.now()
+                });
+            });
+        });
+
+        const processingTime = Date.now() - startTime;
+
+        console.log(`✅ Bundle order created successfully in ${processingTime}ms`);
+        console.log(`   Order IDs: ${orderIds.join(', ')}`);
+        console.log(`   Total amount: ₦${totalCartAmount.toLocaleString()}`);
+
+        res.json({
+            success: true,
+            message: 'Bundle order created successfully',
+            orderIds,
+            totalAmount: totalCartAmount,
+            orderCount: orderIds.length,
+            processingTime,
+            timestamp: Date.now()
+        });
+
+    } catch (error) {
+        console.error('❌ Bundle order creation error:', error);
+
+        let statusCode = 500;
+        let errorMessage = 'Failed to create bundle order';
+
+        if (error.message.includes('Insufficient stock')) {
+            statusCode = 400;
+            errorMessage = error.message;
+        } else if (error.message.includes('Insufficient balance')) {
+            statusCode = 400;
+            errorMessage = error.message;
+        }
+
+        res.status(statusCode).json({
+            success: false,
+            message: errorMessage,
+            error: process.env.NODE_ENV === 'development' ? error.message : undefined,
+            timestamp: Date.now()
+        });
+    }
+});
+
+
+
 // ==========================================
 // 5. ADMIN ROUTES
 // ==========================================
