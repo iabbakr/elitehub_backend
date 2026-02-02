@@ -401,7 +401,9 @@ class WalletService {
                 const buyerTxnRef = buyerRef.collection('transactions').doc();
                 transaction.set(buyerTxnRef, {
                     id: buyerTxnRef.id,
+                    userId: buyerId,
                     type: 'debit',
+                    category: 'order_payment',
                     amount: totalAmount,
                     description: `Order #${orderId.slice(-6)} - Escrow`,
                     timestamp: Date.now(),
@@ -423,7 +425,9 @@ class WalletService {
                 const sellerTxnRef = sellerRef.collection('transactions').doc();
                 transaction.set(sellerTxnRef, {
                     id: sellerTxnRef.id,
+                    userId: sellerId,
                     type: 'credit',
+                    category: 'order_payment',
                     amount: totalAmount - commission,
                     description: `Order #${orderId.slice(-6)} - Pending`,
                     timestamp: Date.now(),
@@ -550,7 +554,9 @@ class WalletService {
                 const sellerTxnRef = sellerRef.collection('transactions').doc();
                 transaction.set(sellerTxnRef, {
                     id: sellerTxnRef.id,
+                    userId: sellerId,
                     type: 'credit',
+                    category: 'order_release',
                     amount: sellerAmount,
                     description: `Order #${orderId.slice(-6)} - Payment Released`,
                     timestamp: Date.now(),
@@ -642,7 +648,9 @@ class WalletService {
                 const buyerTxnRef = buyerRef.collection('transactions').doc();
                 transaction.set(buyerTxnRef, {
                     id: buyerTxnRef.id,
+                    userId: buyerId,
                     type: 'credit',
+                    category: 'order_refund',
                     amount: totalAmount,
                     description: `Order #${orderId.slice(-6)} - Refund: ${reason}`,
                     timestamp: Date.now(),
