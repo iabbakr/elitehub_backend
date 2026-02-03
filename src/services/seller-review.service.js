@@ -150,7 +150,7 @@ class SellerReviewService {
     }
 
     /**
-     * ✅ Get Seller Stats (High Speed via Redis)
+     * ✅ Get Seller Stats
      */
     async getSellerStats(sellerId) {
         const cacheKey = CACHE_KEYS.SELLER_STATS(sellerId);
@@ -161,8 +161,6 @@ class SellerReviewService {
         if (!sellerDoc.exists()) throw new Error('Seller not found');
         
         const data = sellerDoc.data();
-
-        // Count products (Limited query for cost)
         const productsSnap = await db.collection('products')
             .where('sellerId', '==', sellerId)
             .count()
@@ -182,13 +180,31 @@ class SellerReviewService {
 
         await client.setEx(cacheKey, CACHE_TTL.STATS, JSON.stringify(stats));
         return stats;
-    }
+    } // ✅ REMOVED THE COMMA HERE
 
     /**
-     * ✅ Track Profile View (Fire and Forget)
+     * ✅ Get seller rating with counters
      */
+    async getSellerRating(sellerId) { // ✅ REMOVED EXTRA 'async'
+        const cacheKey = CACHE_KEYS.SELLER_RATING(sellerId);
+        const cached = await client.get(cacheKey);
+        if (cached) return JSON.parse(cached);
+
+        const sellerDoc = await db.collection('users').doc(sellerId).get();
+        if (!sellerDoc.exists()) throw new Error('Seller not found');
+        
+        const data = sellerDoc.data();
+        const result = {
+            rating: data.rating || 0,
+            totalReviews: data.totalReviews || 0,
+            reviewCount: data.reviewCount || 0
+        };
+
+        await client.setEx(cacheKey, CACHE_TTL.RATING, JSON.stringify(result));
+        return result;
+    }
+
     async trackView(sellerId) {
-        // We don't use a transaction here to maximize speed and minimize write costs
         await db.collection('users').doc(sellerId).update({
             profileViews: admin.firestore.FieldValue.increment(1)
         });
