@@ -470,237 +470,265 @@ class WalletService {
      * ✅ CRITICAL FIX: Release escrow with strict idempotency and order status check
      */
     async releaseEscrow(orderId, buyerId, sellerId, totalAmount, commission) {
-        const lockKey = `release:lock:${orderId}`;
-        const sellerAmount = totalAmount - commission;
+    const lockKey = `release:lock:${orderId}`;
+    const sellerAmount = totalAmount - commission;
 
-        try {
-            // 1️⃣ REDIS IDEMPOTENCY CHECK (Fast fail for duplicates)
-            const isProcessed = await client.get(lockKey);
-            if (isProcessed) {
-                console.log(`⚠️ Payment already released for order ${orderId}`);
+    try {
+        // 1️⃣ REDIS IDEMPOTENCY CHECK
+        const isProcessed = await client.get(lockKey);
+        if (isProcessed) {
+            console.log(`⚠️ Payment already released for order ${orderId}`);
+            return { 
+                success: true, 
+                alreadyProcessed: true,
+                message: 'Payment was already released'
+            };
+        }
+
+        // 2️⃣ SET REDIS LOCK (24 hour TTL)
+        await client.setEx(lockKey, 86400, 'true');
+
+        const sellerRef = db.collection('wallets').doc(sellerId);
+        const buyerRef = db.collection('wallets').doc(buyerId);
+        const orderRef = db.collection('orders').doc(orderId);
+
+        // 3️⃣ FIREBASE ATOMIC TRANSACTION
+        const result = await db.runTransaction(async (transaction) => {
+            const orderDoc = await transaction.get(orderRef);
+            if (!orderDoc.exists) throw new Error("Order not found");
+
+            const orderData = orderDoc.data();
+
+            // 4️⃣ CRITICAL GUARD: Check if already delivered
+            if (orderData.status === 'delivered') {
                 return { 
                     success: true, 
                     alreadyProcessed: true,
-                    message: 'Payment was already released'
+                    message: 'Order already delivered and paid'
                 };
             }
 
-            // 2️⃣ SET REDIS LOCK IMMEDIATELY (24 hour TTL)
-            await client.setEx(lockKey, 86400, 'true');
+            // 5️⃣ STATUS VALIDATION
+            if (orderData.status !== 'running') {
+                throw new Error(`Invalid order status: ${orderData.status}`);
+            }
 
-            const sellerRef = db.collection('wallets').doc(sellerId);
-            const buyerRef = db.collection('wallets').doc(buyerId);
-            const orderRef = db.collection('orders').doc(orderId);
-
-            // 3️⃣ FIREBASE ATOMIC TRANSACTION
-            const result = await db.runTransaction(async (transaction) => {
-                // Get fresh order data
-                const orderDoc = await transaction.get(orderRef);
-                
-                if (!orderDoc.exists) {
-                    throw new Error("Order not found");
-                }
-
-                const orderData = orderDoc.data();
-
-                // 4️⃣ CRITICAL GUARD: Check if already delivered
-                if (orderData.status === 'delivered') {
-                    console.log(`⚠️ Order ${orderId} already marked as delivered - skipping payment`);
-                    return { 
-                        success: true, 
-                        alreadyProcessed: true,
-                        message: 'Order already delivered and paid'
-                    };
-                }
-
-                // 5️⃣ STATUS VALIDATION
-                if (orderData.status !== 'running') {
-                    throw new Error(
-                        `Invalid order status for payment release. Expected 'running', got '${orderData.status}'`
-                    );
-                }
-
-                // 6️⃣ GET WALLET DATA
-                const [sellerDoc, buyerDoc] = await Promise.all([
-                    transaction.get(sellerRef),
-                    transaction.get(buyerRef)
-                ]);
-
-                if (!sellerDoc.exists || !buyerDoc.exists) {
-                    throw new Error("Wallet not found");
-                }
-
-                const sellerWallet = sellerDoc.data();
-                const buyerWallet = buyerDoc.data();
-
-                // 7️⃣ VALIDATE ESCROW AMOUNT
-                const currentPending = buyerWallet.pendingBalance || 0;
-                if (currentPending < totalAmount) {
-                    console.warn(
-                        `⚠️ Escrow mismatch: Expected ${totalAmount}, found ${currentPending}`
-                    );
-                    // Continue anyway - this prevents blocking legitimate releases
-                }
-
-                // 8️⃣ UPDATE ORDER STATUS (Must happen first!)
-                transaction.update(orderRef, {
-                    status: 'delivered',
-                    buyerConfirmed: true,
-                    deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                // 9️⃣ RELEASE MONEY TO SELLER
-                const sellerTxnRef = sellerRef.collection('transactions').doc();
-                transaction.set(sellerTxnRef, {
-                    id: sellerTxnRef.id,
-                    userId: sellerId,
-                    type: 'credit',
-                    category: 'order_release',
-                    amount: sellerAmount,
-                    description: `Order #${orderId.slice(-6)} - Payment Released`,
-                    timestamp: Date.now(),
-                    status: 'completed',
-                    metadata: { 
-                        orderId, 
-                        commission,
-                        releaseType: 'delivery_confirmation'
-                    }
-                });
-
-                transaction.update(sellerRef, {
-                    balance: admin.firestore.FieldValue.increment(sellerAmount),
-                    pendingBalance: admin.firestore.FieldValue.increment(-sellerAmount),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                // 🔟 CLEAR ESCROW FROM BUYER
-                transaction.update(buyerRef, {
-                    pendingBalance: admin.firestore.FieldValue.increment(-totalAmount),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                console.log(`✅ Released ₦${sellerAmount} to seller ${sellerId} for order ${orderId}`);
-
-                return { 
-                    success: true, 
-                    alreadyProcessed: false,
-                    amount: sellerAmount
-                };
-            });
-
-            // 1️⃣1️⃣ INVALIDATE CACHES
-            await Promise.all([
-                this.invalidateWalletCache(sellerId),
-                this.invalidateWalletCache(buyerId)
+            // 6️⃣ GET WALLET DATA
+            const [sellerDoc, buyerDoc] = await Promise.all([
+                transaction.get(sellerRef),
+                transaction.get(buyerRef)
             ]);
 
-            return result;
-
-        } catch (error) {
-            console.error(`❌ Release escrow error for order ${orderId}:`, error);
-            
-            // If transaction fails, clear the Redis lock to allow retry
-            if (!error.message?.includes('already delivered')) {
-                await client.del(lockKey);
+            if (!sellerDoc.exists || !buyerDoc.exists) {
+                throw new Error("Wallet not found");
             }
+
+            const buyerWallet = buyerDoc.data();
+
+            // 7️⃣ UPDATE ORDER STATUS
+            transaction.update(orderRef, {
+                status: 'delivered',
+                buyerConfirmed: true,
+                deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            // 8️⃣ UPDATE BUYER'S ORIGINAL PENDING TRANSACTION
+            // We use the 'pay_orderId' naming convention established in processOrderPayment
+            const buyerOriginalTxnRef = buyerRef.collection('transactions').doc(`pay_${orderId}`);
+            const buyerTxnSnap = await transaction.get(buyerOriginalTxnRef);
             
-            throw error;
+            if (buyerTxnSnap.exists) {
+                transaction.update(buyerOriginalTxnRef, {
+                    status: 'completed',
+                    description: `Order #${orderId.slice(-6).toUpperCase()} - Completed`,
+                    completedAt: Date.now(),
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+            }
+
+            // 9️⃣ CREATE INFORMATIONAL LOG FOR BUYER
+            // This ensures the buyer sees a new log entry for the release action
+            const buyerInfoTxnRef = buyerRef.collection('transactions').doc();
+            transaction.set(buyerInfoTxnRef, {
+                id: buyerInfoTxnRef.id,
+                userId: buyerId,
+                type: 'debit',
+                category: 'order_release',
+                amount: 0, // Informational: money already left available balance at escrow
+                description: `Order #${orderId.slice(-6).toUpperCase()} - Payment Released to Seller`,
+                timestamp: Date.now(),
+                status: 'completed',
+                metadata: { 
+                    orderId, 
+                    informational: true,
+                    releaseType: 'delivery_confirmation' 
+                }
+            });
+
+            // 🔟 RELEASE MONEY TO SELLER
+            const sellerTxnRef = sellerRef.collection('transactions').doc();
+            transaction.set(sellerTxnRef, {
+                id: sellerTxnRef.id,
+                userId: sellerId,
+                type: 'credit',
+                category: 'order_release',
+                amount: sellerAmount,
+                description: `Order #${orderId.slice(-6).toUpperCase()} - Payment Released`,
+                timestamp: Date.now(),
+                status: 'completed',
+                metadata: { orderId, commission }
+            });
+
+            // 1️⃣1️⃣ UPDATE WALLET BALANCES
+            transaction.update(sellerRef, {
+                balance: admin.firestore.FieldValue.increment(sellerAmount),
+                pendingBalance: admin.firestore.FieldValue.increment(-sellerAmount),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            transaction.update(buyerRef, {
+                pendingBalance: admin.firestore.FieldValue.increment(-totalAmount),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            return { 
+                success: true, 
+                alreadyProcessed: false,
+                amount: sellerAmount
+            };
+        });
+
+        // 1️⃣2️⃣ INVALIDATE CACHES
+        await Promise.all([
+            this.invalidateWalletCache(sellerId),
+            this.invalidateWalletCache(buyerId)
+        ]);
+
+        return result;
+
+    } catch (error) {
+        console.error(`❌ Release escrow error:`, error);
+        if (!error.message?.includes('already delivered')) {
+            await client.del(lockKey);
         }
+        throw error;
     }
+}
 
      /**
      * ✅ ENHANCED: Refund escrow with order status validation
      */
-    async refundEscrow(orderId, buyerId, sellerId, totalAmount, commission, reason) {
-        const lockKey = `refund:lock:${orderId}`;
+    /**
+ * ✅ FULLY UPDATED: Refund escrow with original transaction status update
+ * Ensures buyer logs transition from 'pending' to 'refunded' and seller pending is removed.
+ */
+async refundEscrow(orderId, buyerId, sellerId, totalAmount, commission, reason) {
+    const lockKey = `refund:lock:${orderId}`;
 
-        try {
-            // Idempotency check
-            const isProcessed = await client.get(lockKey);
-            if (isProcessed) {
-                console.log(`⚠️ Refund already processed: ${orderId}`);
-                return { success: true, alreadyProcessed: true };
+    try {
+        // 1️⃣ IDEMPOTENCY CHECK
+        const isProcessed = await client.get(lockKey);
+        if (isProcessed) {
+            console.log(`⚠️ Refund already processed for order: ${orderId}`);
+            return { success: true, alreadyProcessed: true };
+        }
+
+        // 2️⃣ SET REDIS LOCK (24 hour TTL)
+        await client.setEx(lockKey, 86400, 'true');
+
+        const buyerRef = db.collection('wallets').doc(buyerId);
+        const sellerRef = db.collection('wallets').doc(sellerId);
+        const orderRef = db.collection('orders').doc(orderId);
+
+        // 3️⃣ FIREBASE ATOMIC TRANSACTION
+        await db.runTransaction(async (transaction) => {
+            // Verify order status
+            const orderDoc = await transaction.get(orderRef);
+            if (!orderDoc.exists) throw new Error("Order not found");
+
+            const orderData = orderDoc.data();
+
+            // 4️⃣ CRITICAL GUARD: Prevent refunding completed orders
+            if (orderData.status === 'delivered') {
+                throw new Error("Cannot refund delivered orders");
             }
 
-            await client.setEx(lockKey, 86400, 'true');
+            // 5️⃣ UPDATE BUYER'S ORIGINAL PENDING DEBIT
+            // Targets the 'pay_orderId' doc created during order placement
+            const buyerOriginalTxnRef = buyerRef.collection('transactions').doc(`pay_${orderId}`);
+            const originalSnap = await transaction.get(buyerOriginalTxnRef);
+            
+            if (originalSnap.exists) {
+                transaction.update(buyerOriginalTxnRef, {
+                    status: 'refunded',
+                    description: `Order #${orderId.slice(-6).toUpperCase()} - Refunded`,
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+            }
 
-            const buyerRef = db.collection('wallets').doc(buyerId);
-            const sellerRef = db.collection('wallets').doc(sellerId);
-            const orderRef = db.collection('orders').doc(orderId);
-
-            await db.runTransaction(async (transaction) => {
-                // Verify order status
-                const orderDoc = await transaction.get(orderRef);
-                
-                if (!orderDoc.exists) {
-                    throw new Error("Order not found");
+            // 6️⃣ CREATE THE ACTUAL REFUND CREDIT LOG
+            // This shows the money moving back into the available balance
+            const refundTxnRef = buyerRef.collection('transactions').doc();
+            transaction.set(refundTxnRef, {
+                id: refundTxnRef.id,
+                userId: buyerId,
+                type: 'credit',
+                category: 'order_refund',
+                amount: totalAmount,
+                description: `Refund: Order #${orderId.slice(-6).toUpperCase()}`,
+                timestamp: Date.now(),
+                status: 'completed',
+                metadata: { 
+                    orderId, 
+                    reason,
+                    refundType: 'order_cancellation'
                 }
-
-                const orderData = orderDoc.data();
-
-                // Can't refund if already delivered
-                if (orderData.status === 'delivered') {
-                    throw new Error("Cannot refund delivered orders");
-                }
-
-                // Refund buyer
-                const buyerTxnRef = buyerRef.collection('transactions').doc();
-                transaction.set(buyerTxnRef, {
-                    id: buyerTxnRef.id,
-                    userId: buyerId,
-                    type: 'credit',
-                    category: 'order_refund',
-                    amount: totalAmount,
-                    description: `Order #${orderId.slice(-6)} - Refund: ${reason}`,
-                    timestamp: Date.now(),
-                    status: 'completed',
-                    metadata: { 
-                        orderId, 
-                        reason,
-                        refundType: 'order_cancellation'
-                    }
-                });
-
-                transaction.update(buyerRef, {
-                    balance: admin.firestore.FieldValue.increment(totalAmount),
-                    pendingBalance: admin.firestore.FieldValue.increment(-totalAmount),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                // Remove pending from seller
-                transaction.update(sellerRef, {
-                    pendingBalance: admin.firestore.FieldValue.increment(-(totalAmount - commission)),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                // Update order status
-                transaction.update(orderRef, {
-                    status: 'cancelled',
-                    cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
             });
 
-            await Promise.all([
-                this.invalidateWalletCache(buyerId), 
-                this.invalidateWalletCache(sellerId)
-            ]);
+            // 7️⃣ UPDATE BUYER BALANCES
+            transaction.update(buyerRef, {
+                balance: admin.firestore.FieldValue.increment(totalAmount),
+                pendingBalance: admin.firestore.FieldValue.increment(-totalAmount),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
 
-            console.log(`✅ Refund processed for order ${orderId}`);
-            return { success: true, alreadyProcessed: false };
+            // 8️⃣ UPDATE SELLER PENDING BALANCE
+            // Remove the anticipated payment from seller's pending view
+            transaction.update(sellerRef, {
+                pendingBalance: admin.firestore.FieldValue.increment(-(totalAmount - commission)),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
 
-        } catch (error) {
-            console.error(`❌ Refund escrow error for ${orderId}:`, error);
-            
-            // Clear lock on failure to allow retry
-            if (!error.message?.includes('already processed')) {
-                await client.del(lockKey);
-            }
-            
-            throw error;
+            // 9️⃣ UPDATE ORDER STATUS
+            transaction.update(orderRef, {
+                status: 'cancelled',
+                cancelReason: reason,
+                cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+        });
+
+        // 🔟 INVALIDATE CACHES
+        await Promise.all([
+            this.invalidateWalletCache(buyerId), 
+            this.invalidateWalletCache(sellerId)
+        ]);
+
+        console.log(`✅ Refund processed for order ${orderId}`);
+        return { success: true, alreadyProcessed: false };
+
+    } catch (error) {
+        console.error(`❌ Refund escrow error for ${orderId}:`, error);
+        
+        // Clear lock on failure to allow retry (unless order was actually Delivered)
+        if (!error.message?.includes('delivered')) {
+            await client.del(lockKey);
         }
+        
+        throw error;
     }
+}
 
 }
 
