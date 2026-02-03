@@ -25,28 +25,42 @@ class SellerReviewService {
         const lockKey = `seller_review:lock:${orderId}:${buyerId}`;
 
         try {
-            // 1️⃣ Security & Validity Checks
-            const orderDoc = await db.collection('orders').doc(orderId).get();
-            const exists = typeof orderDoc.exists === 'function' ? orderDoc.exists() : orderDoc.exists;
+        // 1️⃣ Security & Validity Checks
+        const orderDoc = await db.collection('orders').doc(orderId).get();
+        if (!orderDoc.exists) throw new Error('Order not found');
 
-            if (!exists) throw new Error('Order not found');
+        const order = orderDoc.data();
+        if (order.buyerId !== buyerId) throw new Error('Unauthorized');
+        if (order.sellerId !== sellerId) throw new Error('Seller mismatch');
+        if (order.status !== 'delivered') throw new Error('You can only review delivered orders');
+        if (order.hasSellerReview) throw new Error('This order has already been reviewed');
+        
+        // --- 🛠️ MODIFIED BLOCK ---
+        const thirtyDays = 30 * 24 * 60 * 60 * 1000;
+        
+        // Use a fallback: if deliveredAt isn't populated yet, use updatedAt or current time
+        // This ensures "immediate" reviews don't fail if the timestamp is still null
+        const deliveryTime = order.deliveredAt ? 
+            (order.deliveredAt._seconds ? order.deliveredAt._seconds * 1000 : order.deliveredAt) : 
+            (order.updatedAt || Date.now());
 
-            const order = orderDoc.data();
-            if (order.buyerId !== buyerId) throw new Error('Unauthorized');
-            if (order.sellerId !== sellerId) throw new Error('Seller mismatch');
-            if (order.status !== 'delivered') throw new Error('You can only review delivered orders');
-            if (order.hasSellerReview) throw new Error('This order has already been reviewed');
-            
-            const thirtyDays = 30 * 24 * 60 * 60 * 1000;
-            const deliveryTime = order.deliveredAt || order.updatedAt;
-            if (Date.now() - deliveryTime > thirtyDays) {
-                throw new Error('Review window has expired (30 days limit)');
-            }
+        const timeElapsed = Date.now() - deliveryTime;
 
-            // 2️⃣ Concurrency Lock
-            const isLocked = await client.get(lockKey);
-            if (isLocked) throw new Error('Processing review, please wait...');
-            await client.setEx(lockKey, 30, 'processing');
+        if (timeElapsed > thirtyDays) {
+            throw new Error('Review window has expired (30 days limit)');
+        }
+        
+        // Optional: Block reviews that are "too fresh" only if you suspect clock skew, 
+        // but generally, allow if timeElapsed is >= 0.
+        if (timeElapsed < -60000) { // Allow for 1 min clock skew
+             throw new Error('Invalid delivery timestamp');
+        }
+        // --- 🛠️ END MODIFIED BLOCK ---
+
+        // 2️⃣ Concurrency Lock
+        const isLocked = await client.get(lockKey);
+        if (isLocked) throw new Error('Processing review, please wait...');
+        await client.setEx(lockKey, 30, 'processing');
 
             const sellerRef = db.collection('users').doc(sellerId);
             const reviewsCol = db.collection('seller_reviews');
