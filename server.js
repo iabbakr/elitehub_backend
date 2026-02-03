@@ -15,6 +15,7 @@ require('./src/jobs/keepAlive');
 const maintenanceGuard = require('./src/middleware/maintenance');
 
 // Route Imports
+const adminRoutes = require('./src/routes/admin.routes');
 const walletRoutes = require('./src/routes/wallet.routes');
 const webhookRoutes = require('./src/routes/webhook.routes');
 const uploadRoutes = require('./src/routes/upload.routes');
@@ -136,6 +137,7 @@ app.get('/api/v1/health', async (req, res) => {
 });
 
 // --- 6. API Routes ---
+app.use('/api/v1/admin', adminRoutes);
 app.use('/api/v1/wallet', walletRoutes);
 app.use('/api/v1/webhooks', webhookRoutes);
 app.use('/api/v1/upload', uploadRoutes);
