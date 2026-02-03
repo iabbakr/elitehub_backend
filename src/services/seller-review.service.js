@@ -158,7 +158,10 @@ class SellerReviewService {
         if (cached) return JSON.parse(cached);
 
         const sellerDoc = await db.collection('users').doc(sellerId).get();
-        if (!sellerDoc.exists()) throw new Error('Seller not found');
+        // Fixed: Check both existence and the method
+        if (!sellerDoc || (typeof sellerDoc.exists === 'function' ? !sellerDoc.exists() : !sellerDoc.exists)) {
+            throw new Error('Seller not found');
+        }
         
         const data = sellerDoc.data();
         const productsSnap = await db.collection('products')
@@ -180,18 +183,17 @@ class SellerReviewService {
 
         await client.setEx(cacheKey, CACHE_TTL.STATS, JSON.stringify(stats));
         return stats;
-    } // ✅ REMOVED THE COMMA HERE
-
+    }
     /**
      * ✅ Get seller rating with counters
      */
-    async getSellerRating(sellerId) { // ✅ REMOVED EXTRA 'async'
+    async getSellerRating(sellerId) { 
         const cacheKey = CACHE_KEYS.SELLER_RATING(sellerId);
         const cached = await client.get(cacheKey);
         if (cached) return JSON.parse(cached);
 
         const sellerDoc = await db.collection('users').doc(sellerId).get();
-        if (!sellerDoc.exists()) throw new Error('Seller not found');
+        if (!sellerDoc.exists) throw new Error('Seller not found');
         
         const data = sellerDoc.data();
         const result = {
