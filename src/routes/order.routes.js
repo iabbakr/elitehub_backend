@@ -17,6 +17,7 @@ const { client, CACHE_KEYS } = require('../config/redis');
 
 const VALID_TRACKING_STATUSES = ['acknowledged', 'enroute', 'ready_for_pickup'];
 
+
 // ==========================================
 // HELPER: Atomic State Guards
 // ==========================================
@@ -169,6 +170,42 @@ router.get('/:orderId', authenticate, async (req, res) => {
         res.status(500).json({ success: false });
     }
 });
+
+/**
+ * GET /api/v1/orders/:orderId
+ * Get single order with caching
+ */
+router.get('/:orderId', authenticate, async (req, res) => {
+    try {
+        const orderId = req.params.orderId;
+        const cacheKey = `order:${orderId}`;
+        
+        // Try cache first
+        const cached = await client.get(cacheKey);
+        if (cached) {
+            const order = JSON.parse(cached);
+            if (order.buyerId !== req.userId && order.sellerId !== req.userId) {
+                return res.status(403).json({ success: false });
+            }
+            return res.json({ success: true, order, cached: true });
+        }
+
+        // Get from Firestore
+        const order = await getDocument('orders', orderId);
+        
+        if (!order || (order.buyerId !== req.userId && order.sellerId !== req.userId)) {
+            return res.status(403).json({ success: false });
+        }
+
+        // Cache for 5 minutes
+        await client.setEx(cacheKey, 300, JSON.stringify(order));
+        res.json({ success: true, order });
+    } catch (error) {
+        console.error('❌ Get order error:', error);
+        res.status(500).json({ success: false });
+    }
+});
+
 
 // ==========================================
 // 2. ORDER CREATION (Atomic)
@@ -753,8 +790,10 @@ router.put('/:orderId/confirm-delivery', authenticate, async (req, res) => {
 
 /**
  * POST /api/v1/orders/bundle
- * ✅ ATOMIC BUNDLE ORDER CREATION
+ * ✅ FIXED: ATOMIC BUNDLE ORDER CREATION
  * Creates multiple orders from a single cart atomically
+ * 
+ * KEY FIX: All Firestore reads BEFORE any writes
  */
 router.post('/bundle', authenticate, async (req, res) => {
     const startTime = Date.now();
@@ -774,25 +813,28 @@ router.post('/bundle', authenticate, async (req, res) => {
         console.log(`📦 Creating bundle order for buyer ${buyerId}`);
         console.log(`   Sub-orders: ${subOrders.length}`);
 
-        // Import Firebase Admin
         const { db, admin } = require('../config/firebase');
         
         const orderIds = [];
         let totalCartAmount = 0;
 
         await db.runTransaction(async (transaction) => {
-            // Phase 1: Collect all product refs
+            // ====================================
+            // PHASE 1: READ ALL DATA FIRST ✅
+            // ====================================
+            
+            // 1a. Collect all product refs
             const allProductRefs = [];
-for (const subOrder of subOrders) {
-    for (const item of subOrder.items) {
-        if (!item.productId) {
-            throw new Error(`Invalid data: Product ID is missing for ${item.productName}`);
-        }
-        allProductRefs.push(db.collection('products').doc(item.productId));
-    }
-}
+            for (const subOrder of subOrders) {
+                for (const item of subOrder.items) {
+                    if (!item.productId) {
+                        throw new Error(`Invalid data: Product ID is missing for ${item.productName}`);
+                    }
+                    allProductRefs.push(db.collection('products').doc(item.productId));
+                }
+            }
 
-            // Phase 2: Read all products
+            // 1b. Read all products
             const productSnaps = await Promise.all(
                 allProductRefs.map(ref => transaction.get(ref))
             );
@@ -804,18 +846,39 @@ for (const subOrder of subOrders) {
                 }
             });
 
-            // Phase 3: Read wallets
+            // 1c. Read buyer wallet
             const buyerWalletRef = db.collection('wallets').doc(buyerId);
             const buyerWalletSnap = await transaction.get(buyerWalletRef);
             
             if (!buyerWalletSnap.exists) {
                 throw new Error('Buyer wallet not found');
             }
-
             const buyerWallet = buyerWalletSnap.data();
-            const stockUpdates = new Map();
 
-            // Phase 4: Process each sub-order
+            // 1d. Collect unique seller IDs and read ALL seller wallets upfront ✅
+            const uniqueSellerIds = [...new Set(subOrders.map(so => so.sellerId))];
+            const sellerWalletRefs = uniqueSellerIds.map(sid => 
+                db.collection('wallets').doc(sid)
+            );
+            
+            const sellerWalletSnaps = await Promise.all(
+                sellerWalletRefs.map(ref => transaction.get(ref))
+            );
+
+            const sellerWalletMap = new Map();
+            sellerWalletSnaps.forEach(snap => {
+                if (snap.exists) {
+                    sellerWalletMap.set(snap.id, snap.data());
+                }
+            });
+
+            // ====================================
+            // PHASE 2: VALIDATE & PREPARE WRITES ✅
+            // ====================================
+            
+            const stockUpdates = new Map();
+            const orderData = []; // Store all order info for writes
+
             for (const subOrder of subOrders) {
                 const newOrderRef = db.collection('orders').doc();
                 const orderId = newOrderRef.id;
@@ -851,78 +914,93 @@ for (const subOrder of subOrders) {
                 const orderCommission = Math.round(orderTotal * 0.10);
                 totalCartAmount += orderTotal;
 
-                // Create order document
-                transaction.set(newOrderRef, {
-                    id: orderId,
-                    buyerId,
+                // Store order data for later writing
+                orderData.push({
+                    orderRef: newOrderRef,
+                    orderId,
                     sellerId: subOrder.sellerId,
-                    products: subOrder.items,
-                    totalAmount: orderTotal,
-                    commission: orderCommission,
+                    orderTotal,
+                    orderCommission,
+                    subOrder
+                });
+            }
+
+            // Check buyer balance BEFORE any writes
+            if (buyerWallet.balance < totalCartAmount) {
+                throw new Error('Insufficient balance');
+            }
+
+            // ====================================
+            // PHASE 3: EXECUTE ALL WRITES ✅
+            // ====================================
+
+            // 3a. Create all orders
+            for (const data of orderData) {
+                transaction.set(data.orderRef, {
+                    id: data.orderId,
+                    buyerId,
+                    sellerId: data.sellerId,
+                    products: data.subOrder.items,
+                    totalAmount: data.orderTotal,
+                    commission: data.orderCommission,
                     status: 'running',
-                    deliveryMethod: subOrder.deliveryMethod,
-                    deliveryFee: subOrder.deliveryFee,
-                    deliveryAddress: subOrder.deliveryAddress,
+                    deliveryMethod: data.subOrder.deliveryMethod,
+                    deliveryFee: data.subOrder.deliveryFee,
+                    deliveryAddress: data.subOrder.deliveryAddress,
                     phoneNumber: phoneNumber || null,
-                    buyerNote: subOrder.buyerNote || null,
+                    buyerNote: data.subOrder.buyerNote || null,
                     disputeStatus: 'none',
                     createdAt: Date.now(),
                     updatedAt: Date.now()
                 });
 
                 // Buyer payment transaction
-                const buyerTxnRef = db.collection(`wallets/${buyerId}/transactions`).doc(`pay_${orderId}`);
+                const buyerTxnRef = db.collection(`wallets/${buyerId}/transactions`).doc(`pay_${data.orderId}`);
                 transaction.set(buyerTxnRef, {
-                    id: `pay_${orderId}`,
+                    id: `pay_${data.orderId}`,
                     userId: buyerId,
                     type: 'debit',
                     category: 'order_payment',
-                    amount: orderTotal,
-                    description: `Order #${orderId.slice(-6).toUpperCase()} - Escrow Hold`,
+                    amount: data.orderTotal,
+                    description: `Order #${data.orderId.slice(-6).toUpperCase()} - Escrow Hold`,
                     status: 'pending',
                     timestamp: Date.now(),
-                    metadata: { orderId }
+                    metadata: { orderId: data.orderId }
                 });
 
                 // Seller pending transaction
-                const sellerTxnRef = db.collection(`wallets/${subOrder.sellerId}/transactions`).doc();
+                const sellerTxnRef = db.collection(`wallets/${data.sellerId}/transactions`).doc();
                 transaction.set(sellerTxnRef, {
                     id: sellerTxnRef.id,
-                    userId: subOrder.sellerId,
+                    userId: data.sellerId,
                     type: 'credit',
                     category: 'order_payment',
-                    amount: orderTotal - orderCommission,
-                    description: `Order #${orderId.slice(-6).toUpperCase()} - Pending Delivery`,
+                    amount: data.orderTotal - data.orderCommission,
+                    description: `Order #${data.orderId.slice(-6).toUpperCase()} - Pending Delivery`,
                     status: 'pending',
                     timestamp: Date.now(),
-                    metadata: { orderId, commission: orderCommission }
+                    metadata: { orderId: data.orderId, commission: data.orderCommission }
                 });
 
-                // Update seller pending balance
-                const sellerWalletRef = db.collection('wallets').doc(subOrder.sellerId);
-                const sellerWalletSnap = await transaction.get(sellerWalletRef);
-                
-                if (sellerWalletSnap.exists()) {
-                    const sellerWallet = sellerWalletSnap.data();
+                // Update seller pending balance (using pre-read data)
+                const sellerWallet = sellerWalletMap.get(data.sellerId);
+                if (sellerWallet) {
+                    const sellerWalletRef = db.collection('wallets').doc(data.sellerId);
                     transaction.update(sellerWalletRef, {
-                        pendingBalance: (sellerWallet.pendingBalance || 0) + (orderTotal - orderCommission),
+                        pendingBalance: (sellerWallet.pendingBalance || 0) + (data.orderTotal - data.orderCommission),
                         updatedAt: Date.now()
                     });
                 }
             }
 
-            // Phase 5: Deduct from buyer balance
-            if (buyerWallet.balance < totalCartAmount) {
-                throw new Error('Insufficient balance');
-            }
-
+            // 3b. Update buyer balance
             transaction.update(buyerWalletRef, {
                 balance: buyerWallet.balance - totalCartAmount,
                 pendingBalance: (buyerWallet.pendingBalance || 0) + totalCartAmount,
                 updatedAt: Date.now()
             });
 
-            // Phase 6: Update stock
+            // 3c. Update product stock
             stockUpdates.forEach((quantity, productId) => {
                 const productRef = db.collection('products').doc(productId);
                 const product = productMap.get(productId);
@@ -972,7 +1050,6 @@ for (const subOrder of subOrders) {
         });
     }
 });
-
 
 
 // ==========================================
