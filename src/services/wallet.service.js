@@ -3,6 +3,8 @@ const { db, admin } = require('../config/firebase');
 const { client } = require('../config/redis');
 const emailService = require('./email.service');     // Added the dot
 const paystackService = require('./paystack.service'); // Ensure this matches too
+const pushNotificationService = require('./push-notification.service'); // Added import
+
 class WalletService {
     /**
      * ✅ SECURITY GATE: Internal helper
@@ -599,6 +601,13 @@ class WalletService {
             };
         });
 
+          await pushNotificationService.sendTransactionAlert(
+    buyerId, 
+    'completed', 
+    totalAmount, 
+    orderId
+);
+
         // 1️⃣2️⃣ INVALIDATE CACHES
         await Promise.all([
             this.invalidateWalletCache(sellerId),
@@ -614,6 +623,8 @@ class WalletService {
         }
         throw error;
     }
+
+  
 }
 
      /**
@@ -709,6 +720,13 @@ async refundEscrow(orderId, buyerId, sellerId, totalAmount, commission, reason) 
             });
         });
 
+        await pushNotificationService.sendTransactionAlert(
+    buyerId, 
+    'refunded', 
+    totalAmount, 
+    orderId
+);
+
         // 🔟 INVALIDATE CACHES
         await Promise.all([
             this.invalidateWalletCache(buyerId), 
@@ -728,6 +746,8 @@ async refundEscrow(orderId, buyerId, sellerId, totalAmount, commission, reason) 
         
         throw error;
     }
+
+    
 }
 
 }

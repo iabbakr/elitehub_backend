@@ -4,6 +4,7 @@ const { db } = require('../config/firebase');
 /**
  * ✅ BACKEND PUSH NOTIFICATION SERVICE
  * Sends push notifications to users via Expo Push Service
+ * Handles Order Updates and Financial Transaction Alerts
  */
 
 class PushNotificationService {
@@ -46,6 +47,12 @@ class PushNotificationService {
 
             const result = await response.json();
 
+            // Handle Expo-specific receipt errors
+            if (result.errors) {
+                console.error('Expo API Errors:', result.errors);
+                return { success: false, errors: result.errors };
+            }
+
             if (result.data?.status === 'error') {
                 console.error('Push notification error:', result.data);
                 return { success: false, error: result.data };
@@ -61,6 +68,37 @@ class PushNotificationService {
     }
 
     /**
+     * Specialized helper for wallet & escrow alerts
+     * Targets transitions to 'completed' or 'refunded'
+     */
+    async sendTransactionAlert(userId, type, amount, orderId) {
+        const shortId = orderId.slice(-6).toUpperCase();
+        let title = "";
+        let body = "";
+
+        if (type === 'completed') {
+            title = "💸 Escrow Released";
+            body = `Payment for Order #${shortId} has been finalized. Thank you for shopping!`;
+        } else if (type === 'refunded') {
+            title = "💰 Refund Successful";
+            body = `₦${amount.toLocaleString()} has been credited back to your wallet for Order #${shortId}.`;
+        } else {
+            title = "💳 Wallet Update";
+            body = `Your transaction for Order #${shortId} has been updated.`;
+        }
+
+        return this.sendPushToUser(userId, title, body, {
+            screen: "ProfileTab",
+            params: { 
+                screen: "Transactions",
+                params: { orderId } // Passes orderId for specific highlight if needed
+            },
+            type: 'wallet_update',
+            orderId
+        });
+    }
+
+    /**
      * Send push to multiple users
      */
     async sendPushToMultipleUsers(userIds, title, body, data = {}) {
@@ -68,8 +106,8 @@ class PushNotificationService {
             userIds.map(userId => this.sendPushToUser(userId, title, body, data))
         );
 
-        const successful = results.filter(r => r.status === 'fulfilled').length;
-        console.log(`✅ Sent ${successful}/${userIds.length} notifications`);
+        const successful = results.filter(r => r.status === 'fulfilled' && r.value.success).length;
+        console.log(`✅ Bulk Push: Sent ${successful}/${userIds.length} successfully`);
 
         return { successful, total: userIds.length };
     }
