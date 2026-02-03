@@ -20,26 +20,30 @@ class SellerReviewService {
      * Fixed: Lifetime average rating math
      * Fixed: Automated counters
      */
+    
     async submitSellerReview(sellerId, buyerId, orderId, buyerName, rating, comment) {
         const lockKey = `seller_review:lock:${orderId}:${buyerId}`;
 
         try {
-            // 1️⃣ Verify Order Status (Security Check)
+            // 1️⃣ Security & Validity Checks
             const orderDoc = await db.collection('orders').doc(orderId).get();
-            if (!orderDoc.exists()) throw new Error('Order not found');
+            const exists = typeof orderDoc.exists === 'function' ? orderDoc.exists() : orderDoc.exists;
+
+            if (!exists) throw new Error('Order not found');
 
             const order = orderDoc.data();
             if (order.buyerId !== buyerId) throw new Error('Unauthorized');
             if (order.sellerId !== sellerId) throw new Error('Seller mismatch');
             if (order.status !== 'delivered') throw new Error('You can only review delivered orders');
+            if (order.hasSellerReview) throw new Error('This order has already been reviewed');
             
-            // Limit review window to 30 days post-delivery
             const thirtyDays = 30 * 24 * 60 * 60 * 1000;
-            if (Date.now() - (order.deliveredAt || order.updatedAt) > thirtyDays) {
-                throw new Error('Review window for this order has expired (30 days limit)');
+            const deliveryTime = order.deliveredAt || order.updatedAt;
+            if (Date.now() - deliveryTime > thirtyDays) {
+                throw new Error('Review window has expired (30 days limit)');
             }
 
-            // 2️⃣ Duplicate Submission Prevention
+            // 2️⃣ Concurrency Lock
             const isLocked = await client.get(lockKey);
             if (isLocked) throw new Error('Processing review, please wait...');
             await client.setEx(lockKey, 30, 'processing');
@@ -47,35 +51,21 @@ class SellerReviewService {
             const sellerRef = db.collection('users').doc(sellerId);
             const reviewsCol = db.collection('seller_reviews');
 
-            // 3️⃣ Atomic Transaction for Rating Consistency
+            // 3️⃣ Atomic Transaction
             const result = await db.runTransaction(async (transaction) => {
                 const sellerDoc = await transaction.get(sellerRef);
-                if (!sellerDoc.exists()) throw new Error('Seller not found');
+                if (!sellerDoc.exists) throw new Error('Seller not found');
 
                 const sellerData = sellerDoc.data();
                 
-                // Get current window reviews (for sliding window)
-                const existingReviewsSnap = await reviewsCol
-                    .where('sellerId', '==', sellerId)
-                    .orderBy('createdAt', 'desc')
-                    .get();
-
-                const existingReviews = existingReviewsSnap.docs;
-
-                // Handle Sliding Window (Maintain max 10 UI reviews)
-                if (existingReviews.length >= 10) {
-                    const toDelete = existingReviews.slice(9);
-                    toDelete.forEach(doc => transaction.delete(doc.ref));
-                }
-
-                // Correct Mathematical Rating (Lifetime Cumulative Average)
+                // Calculate Lifetime cumulative average
                 const oldTotalSum = sellerData.totalRatingSum || 0;
                 const oldTotalCount = sellerData.totalReviews || 0;
                 const newTotalSum = oldTotalSum + rating;
                 const newTotalCount = oldTotalCount + 1;
                 const globalAverage = parseFloat((newTotalSum / newTotalCount).toFixed(1));
 
-                // Create Review Document
+                // Create Review
                 const newReviewRef = reviewsCol.doc();
                 transaction.set(newReviewRef, {
                     id: newReviewRef.id,
@@ -90,18 +80,17 @@ class SellerReviewService {
                     flagCount: 0,
                 });
 
-                // Update Order Status
+                // Update Order
                 transaction.update(db.collection('orders').doc(orderId), {
                     hasSellerReview: true,
                     reviewedAt: Date.now(),
                 });
 
-                // Update Seller Profile Counters
+                // Update Seller Profile
                 transaction.update(sellerRef, {
                     rating: globalAverage,
                     totalRatingSum: admin.firestore.FieldValue.increment(rating),
                     totalReviews: admin.firestore.FieldValue.increment(1),
-                    reviewCount: Math.min(existingReviews.length + 1, 10), // UI Window count
                     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
                 });
 
@@ -158,10 +147,13 @@ class SellerReviewService {
         if (cached) return JSON.parse(cached);
 
         const sellerDoc = await db.collection('users').doc(sellerId).get();
-        // Fixed: Check both existence and the method
-        if (!sellerDoc || (typeof sellerDoc.exists === 'function' ? !sellerDoc.exists() : !sellerDoc.exists)) {
-            throw new Error('Seller not found');
-        }
+    
+    // Use this pattern to be 100% safe
+    const exists = typeof sellerDoc.exists === 'function' ? sellerDoc.exists() : sellerDoc.exists;
+    
+    if (!exists) {
+        throw new Error('Seller not found');
+    }
         
         const data = sellerDoc.data();
         const productsSnap = await db.collection('products')
