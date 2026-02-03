@@ -1,13 +1,33 @@
 // services/push-notification.service.js - BACKEND PUSH SERVICE
-const { db } = require('../config/firebase');
+const { db, admin } = require('../config/firebase');
 
 /**
  * ✅ BACKEND PUSH NOTIFICATION SERVICE
  * Sends push notifications to users via Expo Push Service
- * Handles Order Updates and Financial Transaction Alerts
+ * Handles Badge Counts, Order Updates, and Financial Alerts
  */
-
 class PushNotificationService {
+    /**
+     * Internal helper to atomically increment the badge count in Firestore
+     */
+    async _getAndIncrementBadgeCount(userId) {
+        try {
+            const userRef = db.collection('users').doc(userId);
+            
+            // 1. Atomically increment the field in the database
+            await userRef.set({ 
+                notificationCount: admin.firestore.FieldValue.increment(1) 
+            }, { merge: true });
+            
+            // 2. Fetch the new count to send in the push payload
+            const userDoc = await userRef.get();
+            return userDoc.data()?.notificationCount || 1;
+        } catch (error) {
+            console.error('Failed to update badge count:', error);
+            return 1; 
+        }
+    }
+
     /**
      * Send push notification to a specific user
      */
@@ -23,13 +43,17 @@ class PushNotificationService {
 
             const { token } = tokenDoc.data();
 
+            // ✅ Step 1: Increment and get the count for the icon badge
+            const currentBadgeCount = await this._getAndIncrementBadgeCount(userId);
+
             // Prepare Expo push message
             const message = {
                 to: token,
                 sound: 'default',
                 title,
                 body,
-                badge: data.badge ?? undefined,
+                // ✅ Step 2: Set the icon badge number
+                badge: currentBadgeCount,
                 data,
                 priority: 'high',
                 channelId: 'orders', // Android notification channel
@@ -53,12 +77,7 @@ class PushNotificationService {
                 return { success: false, errors: result.errors };
             }
 
-            if (result.data?.status === 'error') {
-                console.error('Push notification error:', result.data);
-                return { success: false, error: result.data };
-            }
-
-            console.log(`✅ Push sent to ${userId}: ${title}`);
+            console.log(`✅ Push sent to ${userId}: ${title} (Badge: ${currentBadgeCount})`);
             return { success: true, result };
 
         } catch (error) {
@@ -69,7 +88,6 @@ class PushNotificationService {
 
     /**
      * Specialized helper for wallet & escrow alerts
-     * Targets transitions to 'completed' or 'refunded'
      */
     async sendTransactionAlert(userId, type, amount, orderId) {
         const shortId = orderId.slice(-6).toUpperCase();
@@ -91,7 +109,7 @@ class PushNotificationService {
             screen: "ProfileTab",
             params: { 
                 screen: "Transactions",
-                params: { orderId } // Passes orderId for specific highlight if needed
+                params: { orderId } 
             },
             type: 'wallet_update',
             orderId
@@ -112,19 +130,21 @@ class PushNotificationService {
         return { successful, total: userIds.length };
     }
 
-    // Add this to your PushNotificationService class
-async sendSellerPayoutAlert(sellerId, amount, orderId) {
-    const shortId = orderId.slice(-6).toUpperCase();
-    const title = "💸 Payment Received";
-    const body = `₦${amount.toLocaleString()} for Order #${shortId} is now available in your balance.`;
+    /**
+     * Specialized helper for seller payouts
+     */
+    async sendSellerPayoutAlert(sellerId, amount, orderId) {
+        const shortId = orderId.slice(-6).toUpperCase();
+        const title = "💸 Payment Received";
+        const body = `₦${amount.toLocaleString()} for Order #${shortId} is now available in your balance.`;
 
-    return this.sendPushToUser(sellerId, title, body, {
-        screen: "ProfileTab",
-        params: { screen: "Transactions" },
-        type: 'payout_released',
-        orderId
-    });
-}
+        return this.sendPushToUser(sellerId, title, body, {
+            screen: "ProfileTab",
+            params: { screen: "Transactions" },
+            type: 'payout_released',
+            orderId
+        });
+    }
 }
 
 module.exports = new PushNotificationService();
