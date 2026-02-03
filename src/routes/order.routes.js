@@ -783,11 +783,14 @@ router.post('/bundle', authenticate, async (req, res) => {
         await db.runTransaction(async (transaction) => {
             // Phase 1: Collect all product refs
             const allProductRefs = [];
-            for (const subOrder of subOrders) {
-                for (const item of subOrder.items) {
-                    allProductRefs.push(db.collection('products').doc(item.productId));
-                }
-            }
+for (const subOrder of subOrders) {
+    for (const item of subOrder.items) {
+        if (!item.productId) {
+            throw new Error(`Invalid data: Product ID is missing for ${item.productName}`);
+        }
+        allProductRefs.push(db.collection('products').doc(item.productId));
+    }
+}
 
             // Phase 2: Read all products
             const productSnaps = await Promise.all(
