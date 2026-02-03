@@ -111,6 +111,20 @@ class PushNotificationService {
 
         return { successful, total: userIds.length };
     }
+
+    // Add this to your PushNotificationService class
+async sendSellerPayoutAlert(sellerId, amount, orderId) {
+    const shortId = orderId.slice(-6).toUpperCase();
+    const title = "💸 Payment Received";
+    const body = `₦${amount.toLocaleString()} for Order #${shortId} is now available in your balance.`;
+
+    return this.sendPushToUser(sellerId, title, body, {
+        screen: "ProfileTab",
+        params: { screen: "Transactions" },
+        type: 'payout_released',
+        orderId
+    });
+}
 }
 
 module.exports = new PushNotificationService();
