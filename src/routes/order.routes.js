@@ -633,27 +633,32 @@ router.put('/:orderId/cancel-seller', authenticate, async (req, res) => {
 
         // ✅ ATOMIC UPDATE + REFUND
         await db.runTransaction(async (transaction) => {
-            const orderRef = db.collection('orders').doc(orderId);
-            
-            transaction.update(orderRef, {
-                status: 'cancelled',
-                sellerCancelled: true,
-                cancelReason: reason.trim(),
-                cancelledBy: req.userId,
-                cancelledByRole: 'seller',
-                cancelledAt: Date.now(),
-                updatedAt: Date.now()
-            });
+    const orderRef = db.collection('orders').doc(orderId);
+    const sellerRef = db.collection('users').doc(order.sellerId); // Need this ref
 
-            // ⚠️ Increment seller strike (if after acknowledgment)
-            if (order.trackingStatus) {
-                const sellerRef = db.collection('users').doc(order.sellerId);
-                transaction.update(sellerRef, {
-                    autoCancelStrikes: (sellerDoc.autoCancelStrikes || 0) + 1,
-                    updatedAt: Date.now()
-                });
-            }
+    // ✅ ADD THIS: Fetch the seller document within the transaction
+    const sellerSnap = await transaction.get(sellerRef);
+    const sellerData = sellerSnap.data() || {};
+
+    transaction.update(orderRef, {
+        status: 'cancelled',
+        sellerCancelled: true,
+        cancelReason: reason.trim(),
+        cancelledBy: req.userId,
+        cancelledByRole: 'seller',
+        cancelledAt: Date.now(),
+        updatedAt: Date.now()
+    });
+
+    // ⚠️ Increment seller strike (using sellerData instead of sellerDoc)
+    if (order.trackingStatus) {
+        transaction.update(sellerRef, {
+            // ✅ Use the fetched sellerData here
+            autoCancelStrikes: (sellerData.autoCancelStrikes || 0) + 1,
+            updatedAt: Date.now()
         });
+    }
+});
 
         // ✅ Process refund
         await walletService.refundEscrow(
