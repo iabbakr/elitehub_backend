@@ -1,4 +1,3 @@
-// src/services/wallet.service.js - PRODUCTION FIX: Safe Transaction Updates
 const { db, admin } = require('../config/firebase');
 const { client } = require('../config/redis');
 const emailService = require('./email.service');
