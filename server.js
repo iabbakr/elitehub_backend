@@ -1,4 +1,17 @@
 require('dotenv').config();
+
+process.on('uncaughtException', (err) => {
+  console.error('💥 UNCAUGHT EXCEPTION! Shutting down...');
+  console.error(err.name, err.message, err.stack);
+  process.exit(1); 
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('💥 UNHANDLED REJECTION! Shutting down...');
+  console.error(err.name, err.message);
+  process.exit(1);
+});
+
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -154,13 +167,24 @@ app.use('*', (req, res) => {
 });
 
 app.use((err, req, res, next) => {
-  console.error('Error:', err);
-  const statusCode = err.statusCode || 500;
-  const message = process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message;
+  // Log the full error to your Render console
+  console.error(`🔥 [${new Date().toISOString()}] Error on ${req.method} ${req.path}:`, err);
+
+  const statusCode = err.statusCode || err.status || 500;
   
+  // Custom logic to handle common errors
+  let message = err.message || 'Internal server error';
+
+  // If it's a Firestore/Firebase error specifically
+  if (err.code?.startsWith('auth/') || err.code?.startsWith('firestore/')) {
+    message = `Database Error: ${err.message}`;
+  }
+
   res.status(statusCode).json({
     success: false,
-    message,
+    message: message,
+    // Add specific error type (e.g., ReferenceError) to help debugging
+    errorType: err.name,
     ...(process.env.NODE_ENV !== 'production' && { stack: err.stack })
   });
 });
