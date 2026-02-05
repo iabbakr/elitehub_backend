@@ -1,4 +1,4 @@
-// src/services/wallet.service.js - FIXED: Unified Seller Transaction Flow
+// src/services/wallet.service.js - PRODUCTION FIX: Safe Transaction Updates
 const { db, admin } = require('../config/firebase');
 const { client } = require('../config/redis');
 const emailService = require('./email.service');
@@ -6,9 +6,6 @@ const paystackService = require('./paystack.service');
 const pushNotificationService = require('./push-notification.service');
 
 class WalletService {
-    /**
-     * ✅ SECURITY GATE: Internal helper
-     */
     async _verifyWalletStatus(userId) {
         const walletRef = db.collection('wallets').doc(userId);
         const walletDoc = await walletRef.get();
@@ -325,8 +322,7 @@ class WalletService {
     }
 
     /**
-     * ✅ CRITICAL FIX: Single seller transaction that updates from pending → completed
-     * Instead of creating 2 separate transactions, we create ONE that gets updated later
+     * ✅ PRODUCTION FIX: Process order payment with consistent IDs
      */
     async processOrderPayment(buyerId, sellerId, orderId, totalAmount, commission) {
         const lockKey = `order:payment:${orderId}`;
@@ -360,7 +356,7 @@ class WalletService {
                     throw new Error('Insufficient balance');
                 }
 
-                // ✅ FIX 1: Buyer transaction with reference
+                // Buyer transaction
                 const buyerTxnRef = buyerRef.collection('transactions').doc(`pay_${orderId}`);
                 transaction.set(buyerTxnRef, {
                     id: `pay_${orderId}`,
@@ -375,7 +371,7 @@ class WalletService {
                         orderId, 
                         commission,
                         paymentType: 'order_escrow',
-                        reference: `pay_${orderId}` // ✅ Added reference
+                        reference: `pay_${orderId}`
                     }
                 });
 
@@ -385,9 +381,8 @@ class WalletService {
                     updatedAt: admin.firestore.FieldValue.serverTimestamp()
                 });
 
-                // ✅ FIX 2: Create ONE seller transaction (pending) with consistent ID
-                // This will be UPDATED (not replaced) when delivery is confirmed
-                const sellerTxnId = `order_${orderId}`; // Consistent ID
+                // Seller transaction - consistent ID
+                const sellerTxnId = `order_${orderId}`;
                 const sellerTxnRef = sellerRef.collection('transactions').doc(sellerTxnId);
                 transaction.set(sellerTxnRef, {
                     id: sellerTxnId,
@@ -402,7 +397,7 @@ class WalletService {
                         orderId, 
                         commission,
                         paymentType: 'order_pending',
-                        reference: sellerTxnId // ✅ Added reference
+                        reference: sellerTxnId
                     }
                 });
 
@@ -429,7 +424,8 @@ class WalletService {
     }
 
     /**
-     * ✅ CRITICAL FIX: Update existing seller transaction instead of creating new one
+     * ✅ CRITICAL FIX: Safe transaction update with existence check
+     * Uses set with merge option instead of update to handle missing docs
      */
     async releaseEscrow(orderId, buyerId, sellerId, totalAmount, commission) {
         const lockKey = `release:lock:${orderId}`;
@@ -450,11 +446,14 @@ class WalletService {
                 // ==========================================
                 // PHASE 1: ALL READS FIRST ✅
                 // ==========================================
-                const [orderDoc, sellerDoc, buyerDoc, buyerTxnSnap] = await Promise.all([
+                const sellerTxnRef = sellerRef.collection('transactions').doc(`order_${orderId}`);
+                
+                const [orderDoc, sellerDoc, buyerDoc, buyerTxnSnap, sellerTxnSnap] = await Promise.all([
                     transaction.get(orderRef),
                     transaction.get(sellerRef),
                     transaction.get(buyerRef),
-                    transaction.get(buyerOriginalTxnRef)
+                    transaction.get(buyerOriginalTxnRef),
+                    transaction.get(sellerTxnRef) // ✅ Check if seller txn exists
                 ]);
 
                 if (!orderDoc.exists) throw new Error("Order not found");
@@ -476,7 +475,7 @@ class WalletService {
                     updatedAt: admin.firestore.FieldValue.serverTimestamp()
                 });
 
-                // 2. Sync Buyer's Original Payment Log
+                // 2. Update Buyer's Original Payment
                 if (buyerTxnSnap.exists) {
                     transaction.update(buyerOriginalTxnRef, {
                         status: 'completed',
@@ -486,21 +485,38 @@ class WalletService {
                     });
                 }
 
-                // 3. ✅ FIX: UPDATE existing seller transaction instead of creating new one
-                const sellerTxnRef = sellerRef.collection('transactions').doc(`order_${orderId}`);
-                transaction.update(sellerTxnRef, {
-                    status: 'completed',
-                    category: 'order_release',
-                    description: `Order #${orderId.slice(-6).toUpperCase()} - Payment Released`,
-                    completedAt: Date.now(),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
-                    metadata: {
-                        orderId,
-                        commission,
-                        paymentType: 'order_released',
-                        reference: `order_${orderId}` // Keep reference consistent
-                    }
-                });
+                // 3. ✅ FIX: Update or Create seller transaction (safe operation)
+                if (sellerTxnSnap.exists) {
+                    // Transaction exists - UPDATE it
+                    transaction.update(sellerTxnRef, {
+                        status: 'completed',
+                        category: 'order_release',
+                        description: `Order #${orderId.slice(-6).toUpperCase()} - Payment Released`,
+                        completedAt: Date.now(),
+                        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                    });
+                } else {
+                    // Transaction doesn't exist - CREATE it (fallback for old orders)
+                    console.warn(`⚠️ Seller transaction not found for order ${orderId}, creating new one`);
+                    transaction.set(sellerTxnRef, {
+                        id: `order_${orderId}`,
+                        userId: sellerId,
+                        type: 'credit',
+                        category: 'order_release',
+                        amount: sellerAmount,
+                        description: `Order #${orderId.slice(-6).toUpperCase()} - Payment Released`,
+                        timestamp: Date.now(),
+                        status: 'completed',
+                        completedAt: Date.now(),
+                        metadata: { 
+                            orderId, 
+                            commission,
+                            paymentType: 'order_released',
+                            reference: `order_${orderId}`,
+                            fallbackCreated: true // Flag to identify these
+                        }
+                    });
+                }
 
                 // 4. Update Balances
                 transaction.update(sellerRef, {
@@ -545,7 +561,7 @@ class WalletService {
     }
 
     /**
-     * ✅ FIXED: Refund with proper transaction status updates and references
+     * ✅ FIXED: Safe refund with proper transaction handling
      */
     async refundEscrow(orderId, buyerId, sellerId, totalAmount, commission, reason) {
         const lockKey = `refund:lock:${orderId}`;
@@ -561,13 +577,19 @@ class WalletService {
             const orderRef = db.collection('orders').doc(orderId);
 
             await db.runTransaction(async (transaction) => {
-                const orderDoc = await transaction.get(orderRef);
+                const buyerOriginalTxnRef = buyerRef.collection('transactions').doc(`pay_${orderId}`);
+                const sellerTxnRef = sellerRef.collection('transactions').doc(`order_${orderId}`);
+                
+                const [orderDoc, originalSnap, sellerTxnSnap] = await Promise.all([
+                    transaction.get(orderRef),
+                    transaction.get(buyerOriginalTxnRef),
+                    transaction.get(sellerTxnRef)
+                ]);
+                
                 if (!orderDoc.exists) throw new Error("Order not found");
                 if (orderDoc.data().status === 'delivered') throw new Error("Cannot refund delivered orders");
 
-                // 1️⃣ Update buyer's original transaction to refunded
-                const buyerOriginalTxnRef = buyerRef.collection('transactions').doc(`pay_${orderId}`);
-                const originalSnap = await transaction.get(buyerOriginalTxnRef);
+                // 1️⃣ Update buyer's original transaction
                 if (originalSnap.exists) {
                     transaction.update(buyerOriginalTxnRef, {
                         status: 'refunded',
@@ -576,7 +598,7 @@ class WalletService {
                     });
                 }
 
-                // 2️⃣ Create refund credit transaction with reference
+                // 2️⃣ Create refund credit
                 const refundTxnId = `refund_${orderId}`;
                 const refundTxnRef = buyerRef.collection('transactions').doc(refundTxnId);
                 transaction.set(refundTxnRef, {
@@ -592,7 +614,7 @@ class WalletService {
                         orderId, 
                         reason, 
                         refundType: 'order_cancellation',
-                        reference: refundTxnId // ✅ Added reference
+                        reference: refundTxnId
                     }
                 });
 
@@ -602,13 +624,14 @@ class WalletService {
                     updatedAt: admin.firestore.FieldValue.serverTimestamp()
                 });
 
-                // 3️⃣ Update seller's pending transaction to cancelled
-                const sellerTxnRef = sellerRef.collection('transactions').doc(`order_${orderId}`);
-                transaction.update(sellerTxnRef, {
-                    status: 'cancelled',
-                    description: `Order #${orderId.slice(-6).toUpperCase()} - Cancelled`,
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
+                // 3️⃣ Update seller's transaction if it exists
+                if (sellerTxnSnap.exists) {
+                    transaction.update(sellerTxnRef, {
+                        status: 'cancelled',
+                        description: `Order #${orderId.slice(-6).toUpperCase()} - Cancelled`,
+                        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                    });
+                }
 
                 transaction.update(sellerRef, {
                     pendingBalance: admin.firestore.FieldValue.increment(-(totalAmount - commission)),
