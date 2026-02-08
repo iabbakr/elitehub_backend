@@ -5,7 +5,8 @@ const { db, runTransaction, getDocument } = require('../config/firebase');
 const walletService = require('../services/wallet.service');
 const pushNotificationService = require('../services/push-notification.service'); // ✅ FIXED: Import correct service
 const { client, CACHE_KEYS } = require('../config/redis');
-
+const catchAsync = require('../utils/catchAsync');
+const AppError = require('../utils/AppError');
 /**
  * ✅ PRODUCTION-GRADE ATOMIC ORDER SYSTEM
  * Features:
@@ -138,73 +139,49 @@ router.get('/', authenticate, async (req, res) => {
 
 /**
  * GET /api/v1/orders/:orderId
- * Get single order with caching
+ * ✅ PRODUCTION GRADE: Allow Buyer, Seller, AND Staff (Admin/Support)
  */
-router.get('/:orderId', authenticate, async (req, res) => {
-    try {
-        const orderId = req.params.orderId;
-        const cacheKey = `order:${orderId}`;
-        
-        // Try cache first
-        const cached = await client.get(cacheKey);
-        if (cached) {
-            const order = JSON.parse(cached);
-            if (order.buyerId !== req.userId && order.sellerId !== req.userId) {
-                return res.status(403).json({ success: false });
-            }
-            return res.json({ success: true, order, cached: true });
-        }
-
-        // Get from Firestore
-        const order = await getDocument('orders', orderId);
-        
-        if (!order || (order.buyerId !== req.userId && order.sellerId !== req.userId)) {
-            return res.status(403).json({ success: false });
-        }
-
-        // Cache for 5 minutes
-        await client.setEx(cacheKey, 300, JSON.stringify(order));
-        res.json({ success: true, order });
-    } catch (error) {
-        console.error('❌ Get order error:', error);
-        res.status(500).json({ success: false });
+router.get('/:orderId', authenticate, catchAsync(async (req, res, next) => {
+    const { orderId } = req.params;
+    const cacheKey = `order:${orderId}`;
+    
+    // 1. Check Redis Cache
+    const cached = await client.get(cacheKey);
+    let order;
+    
+    if (cached) {
+        order = JSON.parse(cached);
+    } else {
+        // 2. Fetch from Firestore if not in cache
+        order = await getDocument('orders', orderId);
     }
-});
 
-/**
- * GET /api/v1/orders/:orderId
- * Get single order with caching
- */
-router.get('/:orderId', authenticate, async (req, res) => {
-    try {
-        const orderId = req.params.orderId;
-        const cacheKey = `order:${orderId}`;
-        
-        // Try cache first
-        const cached = await client.get(cacheKey);
-        if (cached) {
-            const order = JSON.parse(cached);
-            if (order.buyerId !== req.userId && order.sellerId !== req.userId) {
-                return res.status(403).json({ success: false });
-            }
-            return res.json({ success: true, order, cached: true });
-        }
-
-        // Get from Firestore
-        const order = await getDocument('orders', orderId);
-        
-        if (!order || (order.buyerId !== req.userId && order.sellerId !== req.userId)) {
-            return res.status(403).json({ success: false });
-        }
-
-        // Cache for 5 minutes
-        await client.setEx(cacheKey, 300, JSON.stringify(order));
-        res.json({ success: true, order });
-    } catch (error) {
-        console.error('❌ Get order error:', error);
-        res.status(500).json({ success: false });
+    if (!order) {
+        return next(new AppError('Order not found', 404));
     }
-});
+
+    // --- 🔐 MULTI-ROLE AUTH CHECK ---
+    const isBuyer = order.buyerId === req.userId;
+    const isSeller = order.sellerId === req.userId;
+    
+    // We check req.user.role which is populated by your authenticate middleware
+    const isStaff = ['admin', 'support_agent'].includes(req.user.role);
+
+    if (!isBuyer && !isSeller && !isStaff) {
+        return next(new AppError('Unauthorized: You do not have permission to view this order', 403));
+    }
+    // --------------------------------
+
+    // 3. Cache fresh data for 5 minutes
+    if (!cached) {
+        await client.setEx(cacheKey, 300, JSON.stringify(order));
+    }
+
+    res.status(200).json({
+        success: true,
+        order
+    });
+}));
 
 
 // ==========================================
