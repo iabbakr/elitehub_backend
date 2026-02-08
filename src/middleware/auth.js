@@ -197,6 +197,16 @@ const authorizeOwnership = (resourceType) => {
 const adminOnly = authorize('admin');
 
 /**
+ * Admin or Support Agent middleware
+ */
+const adminOrSupport = authorize('admin', 'support_agent');
+
+/**
+ * Seller-only middleware
+ */
+const sellerOnly = authorize('seller');
+
+/**
  * Seller or Admin middleware
  */
 const sellerOrAdmin = authorize('seller', 'admin');
@@ -278,6 +288,8 @@ module.exports = {
     authorize,
     authorizeOwnership,
     adminOnly,
+    adminOrSupport,
+    sellerOnly,
     sellerOrAdmin,
     serviceOrAdmin,
     userRateLimit,

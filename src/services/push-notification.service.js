@@ -1,10 +1,9 @@
-// services/push-notification.service.js - BACKEND PUSH SERVICE
+// services/push-notification.service.js - ENHANCED WITH DISPUTE NOTIFICATIONS
 const { db, admin } = require('../config/firebase');
 
 /**
- * ✅ BACKEND PUSH NOTIFICATION SERVICE
- * Sends push notifications to users via Expo Push Service
- * Handles Badge Counts, Order Updates, and Financial Alerts
+ * ✅ PRODUCTION-GRADE PUSH NOTIFICATION SERVICE
+ * Enhanced with dispute-specific notifications and reconciliation alerts
  */
 class PushNotificationService {
     /**
@@ -14,12 +13,10 @@ class PushNotificationService {
         try {
             const userRef = db.collection('users').doc(userId);
             
-            // 1. Atomically increment the field in the database
             await userRef.set({ 
                 notificationCount: admin.firestore.FieldValue.increment(1) 
             }, { merge: true });
             
-            // 2. Fetch the new count to send in the push payload
             const userDoc = await userRef.get();
             return userDoc.data()?.notificationCount || 1;
         } catch (error) {
@@ -33,7 +30,6 @@ class PushNotificationService {
      */
     async sendPushToUser(userId, title, body, data = {}) {
         try {
-            // Get user's push token from Firestore
             const tokenDoc = await db.collection('pushTokens').doc(userId).get();
             
             if (!tokenDoc.exists) {
@@ -42,24 +38,19 @@ class PushNotificationService {
             }
 
             const { token } = tokenDoc.data();
-
-            // ✅ Step 1: Increment and get the count for the icon badge
             const currentBadgeCount = await this._getAndIncrementBadgeCount(userId);
 
-            // Prepare Expo push message
             const message = {
                 to: token,
                 sound: 'default',
                 title,
                 body,
-                // ✅ Step 2: Set the icon badge number
                 badge: currentBadgeCount,
                 data,
                 priority: 'high',
-                channelId: 'orders', // Android notification channel
+                channelId: 'orders',
             };
 
-            // Send to Expo Push Service
             const response = await fetch('https://exp.host/--/api/v2/push/send', {
                 method: 'POST',
                 headers: {
@@ -71,7 +62,6 @@ class PushNotificationService {
 
             const result = await response.json();
 
-            // Handle Expo-specific receipt errors
             if (result.errors) {
                 console.error('Expo API Errors:', result.errors);
                 return { success: false, errors: result.errors };
@@ -84,6 +74,105 @@ class PushNotificationService {
             console.error('Push notification failed:', error);
             return { success: false, error: error.message };
         }
+    }
+
+    /**
+     * ✅ NEW: Dispute-specific notifications
+     */
+    async sendDisputeAlert(userId, type, orderId, additionalInfo = {}) {
+        const shortId = orderId.slice(-6).toUpperCase();
+        let title = "";
+        let body = "";
+        let screenData = {
+            screen: "OrdersTab",
+            params: {
+                screen: "DisputeChatScreen",
+                params: { orderId }
+            }
+        };
+
+        switch (type) {
+            case 'dispute_opened':
+                title = "⚠️ Dispute Opened";
+                body = `A dispute has been opened for Order #${shortId}`;
+                break;
+            
+            case 'dispute_message':
+                title = "💬 New Dispute Message";
+                body = `You have a new message regarding Order #${shortId}`;
+                break;
+            
+            case 'dispute_resolved_buyer':
+                title = "✅ Dispute Resolved";
+                body = additionalInfo.resolution === 'refund' 
+                    ? `Your refund for Order #${shortId} has been processed`
+                    : `Payment for Order #${shortId} has been released to seller`;
+                screenData.screen = "OrderDetailScreen";
+                break;
+            
+            case 'dispute_resolved_seller':
+                title = "✅ Dispute Resolved";
+                body = additionalInfo.resolution === 'release' 
+                    ? `Payment for Order #${shortId} has been released to you`
+                    : `Buyer has been refunded for Order #${shortId}`;
+                screenData.screen = "OrderDetailScreen";
+                break;
+            
+            case 'admin_reviewing':
+                title = "👁️ Admin Review";
+                body = `Support is now reviewing your dispute for Order #${shortId}`;
+                break;
+
+            case 'reconciliation_offer':
+                title = "🤝 Reconciliation Offer";
+                body = `${additionalInfo.fromRole} has proposed a solution for Order #${shortId}`;
+                break;
+
+            default:
+                title = "Dispute Update";
+                body = `Your dispute for Order #${shortId} has been updated`;
+        }
+
+        return this.sendPushToUser(userId, title, body, {
+            ...screenData,
+            type: 'dispute_update',
+            orderId,
+            disputeType: type,
+            ...additionalInfo
+        });
+    }
+
+    /**
+     * ✅ NEW: Send reconciliation notification to both parties
+     */
+    async sendReconciliationNotification(buyerId, sellerId, orderId, proposalDetails) {
+        const shortId = orderId.slice(-6).toUpperCase();
+        
+        const notifications = [
+            this.sendPushToUser(
+                buyerId,
+                "🤝 Reconciliation Proposal",
+                `Seller proposed: "${proposalDetails.summary}" for Order #${shortId}`,
+                {
+                    screen: "DisputeChatScreen",
+                    params: { orderId },
+                    type: 'reconciliation',
+                    proposal: proposalDetails
+                }
+            ),
+            this.sendPushToUser(
+                sellerId,
+                "📝 Proposal Sent",
+                `Your reconciliation proposal for Order #${shortId} has been sent to the buyer`,
+                {
+                    screen: "DisputeChatScreen",
+                    params: { orderId },
+                    type: 'reconciliation_sent'
+                }
+            )
+        ];
+
+        return Promise.allSettled(notifications);
     }
 
     /**
@@ -144,6 +233,59 @@ class PushNotificationService {
             type: 'payout_released',
             orderId
         });
+    }
+
+    /**
+     * ✅ NEW: Send notification to admin/support when dispute is opened
+     */
+    async notifyAdminsOfNewDispute(orderId, disputeDetails) {
+        try {
+            const shortId = orderId.slice(-6).toUpperCase();
+            
+            // Get all admins and support agents
+            const adminsSnapshot = await db.collection('users')
+                .where('role', 'in', ['admin', 'support_agent'])
+                .get();
+
+            const adminIds = adminsSnapshot.docs.map(doc => doc.id);
+
+            if (adminIds.length === 0) {
+                console.warn('No admins found to notify');
+                return;
+            }
+
+            await this.sendPushToMultipleUsers(
+                adminIds,
+                "🚨 New Dispute Opened",
+                `Order #${shortId}: ${disputeDetails.slice(0, 50)}...`,
+                {
+                    screen: "ProfileTab",
+                    params: {
+                        screen: "AdminDisputeScreen",
+                        params: { orderId }
+                    },
+                    type: 'admin_dispute_alert',
+                    orderId,
+                    priority: 'high'
+                }
+            );
+
+        } catch (error) {
+            console.error('Failed to notify admins:', error);
+        }
+    }
+
+    /**
+     * ✅ NEW: Clear notification badge for user
+     */
+    async clearBadgeCount(userId) {
+        try {
+            await db.collection('users').doc(userId).update({
+                notificationCount: 0
+            });
+        } catch (error) {
+            console.error('Failed to clear badge count:', error);
+        }
     }
 }
 

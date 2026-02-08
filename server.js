@@ -38,6 +38,7 @@ const orderRoutes = require('./src/routes/order.routes');
 const billRoutes = require('./src/routes/bill.routes');
 const paymentRoutes = require('./src/routes/payment.routes');
 const sellerReviewRoutes = require('./src/routes/seller-review.routes');
+const disputeRoutes = require('./src/routes/dispute.routes'); // Add this!
 
 const app = express();
 
@@ -160,33 +161,50 @@ app.use('/api/v1/orders', orderRoutes);
 app.use('/api/v1/bills', billRoutes);
 app.use('/api/v1/payments', paymentRoutes);
 app.use('/api/v1/seller-reviews', sellerReviewRoutes);
+app.use('/api/v1/disputes', disputeRoutes); // Add this!
 
-// --- 7. Error Handling ---
-app.use('*', (req, res) => {
-  res.status(404).json({ success: false, message: 'Route not found' });
+app.all('*', (req, res, next) => {
+  res.status(404).json({
+    success: false,
+    message: `Can't find ${req.originalUrl} on this server!`
+  });
 });
 
+// --- 7. Error Handling ---
 app.use((err, req, res, next) => {
-  // Log the full error to your Render console
-  console.error(`🔥 [${new Date().toISOString()}] Error on ${req.method} ${req.path}:`, err);
+  err.statusCode = err.statusCode || 500;
+  err.status = err.status || 'error';
 
-  const statusCode = err.statusCode || err.status || 500;
-  
-  // Custom logic to handle common errors
-  let message = err.message || 'Internal server error';
+  // 1. Log full error for internal debugging
+  console.error(`🔥 [${new Date().toISOString()}] ${err.name}: ${err.message}`);
+  if (err.stack) console.error(err.stack);
 
-  // If it's a Firestore/Firebase error specifically
-  if (err.code?.startsWith('auth/') || err.code?.startsWith('firestore/')) {
-    message = `Database Error: ${err.message}`;
+  // 2. Response logic
+  if (process.env.NODE_ENV === 'development') {
+    // Detailed error for developers
+    res.status(err.statusCode).json({
+      success: false,
+      status: err.status,
+      message: err.message,
+      error: err,
+      stack: err.stack
+    });
+  } else {
+    // Production response
+    if (err.isOperational) {
+      // Known operational errors (Validation, Auth, etc.)
+      res.status(err.statusCode).json({
+        success: false,
+        message: err.message
+      });
+    } else {
+      // Unknown programming/system errors (ReferenceError, etc.)
+      res.status(500).json({
+        success: false,
+        message: 'Something went very wrong on our end.'
+      });
+    }
   }
-
-  res.status(statusCode).json({
-    success: false,
-    message: message,
-    // Add specific error type (e.g., ReferenceError) to help debugging
-    errorType: err.name,
-    ...(process.env.NODE_ENV !== 'production' && { stack: err.stack })
-  });
 });
 
 // --- 8. Initialization & Shutdown ---

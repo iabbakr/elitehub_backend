@@ -5,10 +5,10 @@ const cloudinary = require('cloudinary').v2;
  * Cloudinary integration with automatic optimization
  */
 
-// Configure Cloudinary
+// Configure Cloudinary with fallback to EXPO_PUBLIC prefix for frontend compatibility
 cloudinary.config({
     cloud_name: process.env.CLOUDINARY_CLOUD_NAME || process.env.EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME,
-    api_key: process.env.CLOUDINARY_API_KEY,
+    api_key: process.env.CLOUDINARY_API_KEY || process.env.EXPO_PUBLIC_CLOUDINARY_API_KEY,
     api_secret: process.env.CLOUDINARY_API_SECRET,
     secure: true
 });
@@ -35,8 +35,8 @@ class CDNService {
         return {
             signature,
             timestamp,
-            apiKey: process.env.CLOUDINARY_API_KEY,
-            cloudName: process.env.CLOUDINARY_CLOUD_NAME,
+            apiKey: process.env.CLOUDINARY_API_KEY || process.env.EXPO_PUBLIC_CLOUDINARY_API_KEY,
+            cloudName: process.env.CLOUDINARY_CLOUD_NAME || process.env.EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME,
             folder,
             uploadPreset: process.env.CLOUDINARY_UPLOAD_PRESET
         };
@@ -220,7 +220,7 @@ class CDNService {
      */
     getCdnUrl(path) {
         const cdnBase = process.env.CDN_BASE_URL || 
-            `https://res.cloudinary.com/${process.env.CLOUDINARY_CLOUD_NAME}`;
+            `https://res.cloudinary.com/${process.env.CLOUDINARY_CLOUD_NAME || process.env.EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME}`;
         
         // Remove leading slash if present
         const cleanPath = path.replace(/^\/+/, '');

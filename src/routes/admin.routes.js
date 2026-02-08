@@ -20,6 +20,32 @@ router.post('/system/maintenance', authenticate, adminOnly, async (req, res) => 
 });
 
 /**
+ * PARDON SELLER (Reset auto-cancel strikes)
+ */
+router.post('/pardon-seller/:sellerId', authenticate, adminOnly, async (req, res) => {
+    try {
+        const { sellerId } = req.params;
+        
+        await db.collection('users').doc(sellerId).update({
+            autoCancelStrikes: 0,
+            isSuspended: false,
+            updatedAt: Date.now()
+        });
+
+        res.json({ 
+            success: true, 
+            message: 'Seller account reinstated successfully' 
+        });
+    } catch (error) {
+        console.error('Pardon seller error:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
+    }
+});
+
+/**
  * RESOLVE DISPUTE (Atomic release/refund)
  */
 router.post('/resolve-dispute', authenticate, adminOnly, async (req, res) => {
@@ -27,17 +53,38 @@ router.post('/resolve-dispute', authenticate, adminOnly, async (req, res) => {
 
     try {
         const orderSnap = await db.collection('orders').doc(orderId).get();
-        if (!orderSnap.exists) return res.status(404).json({ success: false, message: 'Order not found' });
+        if (!orderSnap.exists) {
+            return res.status(404).json({ 
+                success: false, 
+                message: 'Order not found' 
+            });
+        }
         
         const order = orderSnap.data();
         if (order.disputeStatus !== 'open') {
-            return res.status(400).json({ success: false, message: 'No open dispute found' });
+            return res.status(400).json({ 
+                success: false, 
+                message: 'No open dispute found' 
+            });
         }
 
         if (resolution === 'release') {
-            await walletService.releaseEscrow(orderId, order.buyerId, order.sellerId, order.totalAmount, order.commission);
+            await walletService.releaseEscrow(
+                orderId, 
+                order.buyerId, 
+                order.sellerId, 
+                order.totalAmount, 
+                order.commission
+            );
         } else if (resolution === 'refund') {
-            await walletService.refundEscrow(orderId, order.buyerId, order.sellerId, order.totalAmount, order.commission, `Admin Resolution: ${adminNote}`);
+            await walletService.refundEscrow(
+                orderId, 
+                order.buyerId, 
+                order.sellerId, 
+                order.totalAmount, 
+                order.commission, 
+                `Admin Resolution: ${adminNote}`
+            );
         }
 
         await db.collection('orders').doc(orderId).update({
@@ -55,9 +102,16 @@ router.post('/resolve-dispute', authenticate, adminOnly, async (req, res) => {
             { screen: "OrderDetailScreen", params: { orderId } }
         );
 
-        res.json({ success: true, message: `Dispute resolved via ${resolution}` });
+        res.json({ 
+            success: true, 
+            message: `Dispute resolved via ${resolution}` 
+        });
     } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
+        console.error('Resolve dispute error:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
     }
 });
 
@@ -70,7 +124,11 @@ router.post('/system/sync-transactions', authenticate, adminOnly, async (req, re
         const result = await syncStuckTransactions();
         res.json({ success: true, ...result });
     } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
+        console.error('Sync transactions error:', error);
+        res.status(500).json({ 
+            success: false, 
+            message: error.message 
+        });
     }
 });
 
