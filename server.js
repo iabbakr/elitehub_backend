@@ -161,7 +161,8 @@ app.use('/api/v1/orders', orderRoutes);
 app.use('/api/v1/bills', billRoutes);
 app.use('/api/v1/payments', paymentRoutes);
 app.use('/api/v1/seller-reviews', sellerReviewRoutes);
-app.use('/api/v1/disputes', disputeRoutes); // Add this!
+app.use('/api/v1/disputes', disputeRoutes); // Standard participant access
+app.use('/api/v1/admin/disputes', disputeRoutes); // Admin dashboard access
 
 app.all('*', (req, res, next) => {
   res.status(404).json({
