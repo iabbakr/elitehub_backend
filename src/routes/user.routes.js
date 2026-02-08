@@ -5,6 +5,45 @@ const { userCacheMiddleware, cacheMiddleware } = require('../middleware/cache');
 const { getDocument, updateDocument, queryDocuments } = require('../config/firebase');
 const { invalidateUserCache, CACHE_TTL } = require('../config/redis');
 
+const EmailService = require('../services/email.service');
+
+
+/**
+ * POST /api/v1/users/welcome
+ * Triggered by frontend after a successful signup
+ */
+router.post('/welcome', async (req, res) => {
+  const { email, name, role } = req.body;
+
+  // Basic validation
+  if (!email || !name || !role) {
+    return res.status(400).json({ success: false, message: 'Missing required fields' });
+  }
+
+  try {
+    // Determine which welcome email to send based on the user's role
+    switch (role) {
+      case 'seller':
+        await EmailService.sendSellerWelcomeEmail(email, name);
+        break;
+      case 'service':
+        await EmailService.sendServiceWelcomeEmail(email, name);
+        break;
+      case 'buyer':
+      default:
+        await EmailService.sendBuyerWelcomeEmail(email, name);
+        break;
+    }
+
+    res.status(200).json({ success: true, message: 'Welcome email sent successfully' });
+  } catch (error) {
+    // Log the error but don't expose sensitive info to the client
+    console.error('Email Trigger Error:', error);
+    res.status(500).json({ success: false, message: 'Failed to send welcome email' });
+  }
+});
+
+module.exports = router;
 /**
  * USER ROUTES
  * Optimized with Redis caching to reduce Firebase reads
