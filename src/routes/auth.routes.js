@@ -194,19 +194,23 @@ router.post('/signup', catchAsync(async (req, res, next) => {
     const customToken = await auth.createCustomToken(uid);
 
     // ✅ SEND WELCOME EMAIL (Fire and forget)
-    setImmediate(async () => {
-      try {
-        if (role === 'seller') {
-          await EmailService.sendSellerWelcomeEmail(email.trim(), name.trim());
-        } else if (role === 'service') {
-          await EmailService.sendServiceWelcomeEmail(email.trim(), name.trim());
-        } else {
-          await EmailService.sendBuyerWelcomeEmail(email.trim(), name.trim());
-        }
-      } catch (error) {
-        console.error('Welcome email failed:', error);
-      }
-    });
+    // ✅ UPDATED ONBOARDING TRIGGER
+setImmediate(async () => {
+  try {
+    console.log(`Attempting to send welcome email to: ${email.trim()}`);
+    if (role === 'seller') {
+      await EmailService.sendSellerWelcomeEmail(email.trim(), name.trim());
+    } else if (role === 'service') {
+      await EmailService.sendServiceWelcomeEmail(email.trim(), name.trim());
+    } else {
+      await EmailService.sendBuyerWelcomeEmail(email.trim(), name.trim());
+    }
+    console.log(`✅ Welcome email process completed for ${email.trim()}`);
+  } catch (error) {
+    // This will now show up in your Render logs
+    console.error('❌ CRITICAL: Welcome email failed during signup:', error);
+  }
+});
 
     // ✅ RESPONSE
     res.status(201).json({
