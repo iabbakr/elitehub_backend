@@ -174,38 +174,33 @@ class ProductCacheService {
   /**
    * Search products with caching
    */
+  
   async searchProducts(query, filters = {}) {
-    try {
-      const searchKey = `search:${query}:${JSON.stringify(filters)}`;
-      const cacheKey = `cache:${searchKey}`;
-      
-      const cached = await getCache(cacheKey);
-      
-      if (cached) {
-        console.log(`✅ Cache HIT: Search "${query}"`);
-        return cached.map(p => this.optimizeProductImages(p));
-      }
+    const { category, minPrice, maxPrice, state } = filters;
+    
+    // 🛡️ SENIOR MOVE: Dynamic Cache Key for specific filter combinations
+    const filterHash = crypto.createHash('md5')
+      .update(JSON.stringify({category, minPrice, maxPrice, state}))
+      .digest('hex');
+    const cacheKey = `search:${query || 'none'}:${filterHash}`;
 
-      console.log(`⚠️ Cache MISS: Search "${query}"`);
-      
-      // Fetch all products (in production, use Algolia/Elasticsearch)
-      let productsQuery = db.collection('products');
-      
-      // Apply filters
-      if (filters.category) {
-        productsQuery = productsQuery.where('category', '==', filters.category);
-      }
-      
-      if (filters.minPrice) {
-        productsQuery = productsQuery.where('price', '>=', parseFloat(filters.minPrice));
-      }
-      
-      if (filters.maxPrice) {
-        productsQuery = productsQuery.where('price', '<=', parseFloat(filters.maxPrice));
-      }
+    const cached = await getCache(cacheKey);
+    if (cached) return cached;
 
-      const snapshot = await productsQuery.limit(100).get();
-      
+    let productsQuery = db.collection('products');
+
+    // These combinations MUST have composite indexes in Firebase Console
+    if (category) productsQuery = productsQuery.where('category', '==', category);
+    if (state) productsQuery = productsQuery.where('location.state', '==', state);
+    
+    // Range filters
+    if (minPrice) productsQuery = productsQuery.where('price', '>=', parseFloat(minPrice));
+    if (maxPrice) productsQuery = productsQuery.where('price', '<=', parseFloat(maxPrice));
+
+    // Always sort to ensure index consistency
+    productsQuery = productsQuery.orderBy('price', 'asc').orderBy('createdAt', 'desc');
+
+    const snapshot = await productsQuery.limit(100).get();
       let products = [];
       snapshot.forEach(doc => {
         products.push({ id: doc.id, ...doc.data() });
@@ -229,7 +224,7 @@ class ProductCacheService {
       console.error('Search products error:', error);
       throw error;
     }
-  }
+  
 
   /**
    * Invalidate product caches

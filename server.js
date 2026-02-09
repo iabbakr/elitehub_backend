@@ -40,6 +40,8 @@ const paymentRoutes = require('./src/routes/payment.routes');
 const sellerReviewRoutes = require('./src/routes/seller-review.routes');
 const disputeRoutes = require('./src/routes/dispute.routes'); // Add this!
 const authRoutes = require('./src/routes/auth.routes'); // 👈 ADD THIS
+const systemRoutes = require('./src/routes/system.routes');
+const activityRoutes = require('./src/routes/activity.routes');
 
 const app = express();
 
@@ -165,6 +167,8 @@ app.use('/api/v1/payments', paymentRoutes);
 app.use('/api/v1/seller-reviews', sellerReviewRoutes);
 app.use('/api/v1/disputes', disputeRoutes); // Standard participant access
 app.use('/api/v1/admin/disputes', disputeRoutes); // Admin dashboard access
+app.use('/api/v1/system', systemRoutes);
+app.use('/api/v1/activity', activityRoutes);
 
 app.all('*', (req, res, next) => {
   res.status(404).json({
