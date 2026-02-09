@@ -39,6 +39,7 @@ const billRoutes = require('./src/routes/bill.routes');
 const paymentRoutes = require('./src/routes/payment.routes');
 const sellerReviewRoutes = require('./src/routes/seller-review.routes');
 const disputeRoutes = require('./src/routes/dispute.routes'); // Add this!
+const authRoutes = require('./src/routes/auth.routes'); // 👈 ADD THIS
 
 const app = express();
 
@@ -151,6 +152,7 @@ app.get('/api/v1/health', async (req, res) => {
 });
 
 // --- 6. API Routes ---
+app.use('/api/v1/auth', authRoutes);
 app.use('/api/v1/admin', adminRoutes);
 app.use('/api/v1/wallet', walletRoutes);
 app.use('/api/v1/webhooks', webhookRoutes);
