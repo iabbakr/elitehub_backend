@@ -6,7 +6,7 @@ const { getCache, setCache, CACHE_KEYS, CACHE_TTL } = require('../config/redis')
  */
 
 /**
- * Verify Firebase ID Token
+ * ✅ FIXED: Verify Firebase ID Token AND populate req.user.role
  */
 const authenticate = async (req, res, next) => {
     try {
@@ -31,9 +31,36 @@ const authenticate = async (req, res, next) => {
             });
         }
 
-        // Add user info to request
-        req.user = decodedToken;
+        // ✅ CRITICAL FIX: Get user profile to populate role
+        const { getDocument } = require('../config/firebase');
+        const cacheKey = CACHE_KEYS.USER_PROFILE(decodedToken.uid);
+        
+        // Try cache first
+        let userProfile = await getCache(cacheKey);
+        
+        // If not cached, fetch from Firestore
+        if (!userProfile) {
+            userProfile = await getDocument('users', decodedToken.uid);
+            
+            if (!userProfile) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'User profile not found'
+                });
+            }
+            
+            // Cache for 5 minutes
+            await setCache(cacheKey, userProfile, CACHE_TTL.SHORT);
+        }
+
+        // ✅ FIX: Populate both decodedToken data AND user profile with role
+        req.user = {
+            ...decodedToken,
+            role: userProfile.role,  // This is what's missing!
+            uid: decodedToken.uid
+        };
         req.userId = decodedToken.uid;
+        req.userProfile = userProfile; // Also keep full profile
         
         next();
     } catch (error) {
@@ -57,8 +84,19 @@ const optionalAuth = async (req, res, next) => {
             const decodedToken = await verifyToken(idToken);
             
             if (decodedToken) {
-                req.user = decodedToken;
-                req.userId = decodedToken.uid;
+                // ✅ Also populate role for optional auth
+                const { getDocument } = require('../config/firebase');
+                const userProfile = await getDocument('users', decodedToken.uid);
+                
+                if (userProfile) {
+                    req.user = {
+                        ...decodedToken,
+                        role: userProfile.role,
+                        uid: decodedToken.uid
+                    };
+                    req.userId = decodedToken.uid;
+                    req.userProfile = userProfile;
+                }
             }
         }
         
@@ -82,24 +120,14 @@ const authorize = (...allowedRoles) => {
                 });
             }
 
-            // Try to get user profile from cache first
-            const cacheKey = CACHE_KEYS.USER_PROFILE(req.userId);
-            let userProfile = await getCache(cacheKey);
+            // ✅ Use req.userProfile which is already populated by authenticate
+            const userProfile = req.userProfile;
             
-            // If not in cache, fetch from database
             if (!userProfile) {
-                const { getDocument } = require('../config/firebase');
-                userProfile = await getDocument('users', req.userId);
-                
-                if (!userProfile) {
-                    return res.status(404).json({
-                        success: false,
-                        message: 'User not found'
-                    });
-                }
-                
-                // Cache for 5 minutes
-                await setCache(cacheKey, userProfile, CACHE_TTL.SHORT);
+                return res.status(404).json({
+                    success: false,
+                    message: 'User not found'
+                });
             }
 
             // Check if user has required role
@@ -110,8 +138,6 @@ const authorize = (...allowedRoles) => {
                 });
             }
 
-            // Add user profile to request
-            req.userProfile = userProfile;
             next();
         } catch (error) {
             console.error('Authorization error:', error);
@@ -167,7 +193,7 @@ const authorizeOwnership = (resourceType) => {
                     isOwner = resource.userId === userId || resource.uid === userId;
             }
 
-            // Admin override
+            // ✅ Admin override - use req.userProfile.role
             if (req.userProfile?.role === 'admin') {
                 isOwner = true;
             }
