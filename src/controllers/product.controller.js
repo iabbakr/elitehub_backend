@@ -1,20 +1,25 @@
-// src/controllers/product.controller.js
 const { db } = require('../config/firebase');
 const { client: redis } = require('../config/redis');
 const catchAsync = require('../utils/catchAsync');
+const productCacheService = require('../services/productCacheService');
+const AppError = require('../utils/AppError');
+
+// --- 1. Discovery Methods (High Performance) ---
 
 exports.getProducts = catchAsync(async (req, res, next) => {
-  const { category, state } = req.query;
-  // Dynamic cache key including state for localized results
-  const cacheKey = `products:${category || 'all'}:${state || 'global'}`;
+  const { category, state, search } = req.query;
+  
+  // If searching, we use the search service logic
+  if (search) {
+    const products = await productCacheService.searchProducts(search, { category, state });
+    return res.json({ success: true, products });
+  }
 
+  const cacheKey = `products:${category || 'all'}:${state || 'global'}`;
   const cachedData = await redis.get(cacheKey);
+  
   if (cachedData) {
-    return res.status(200).json({
-      success: true,
-      source: 'cache',
-      products: JSON.parse(cachedData)
-    });
+    return res.status(200).json({ success: true, source: 'cache', products: JSON.parse(cachedData) });
   }
 
   let query = db.collection('products').orderBy('createdAt', 'desc');
@@ -31,20 +36,88 @@ exports.getProducts = catchAsync(async (req, res, next) => {
   res.status(200).json({ success: true, source: 'database', products });
 });
 
+exports.getProduct = catchAsync(async (req, res, next) => {
+  const product = await productCacheService.getProduct(req.params.id);
+  if (!product) return next(new AppError('Product not found', 404));
+  
+  res.json({ success: true, product });
+});
+
+// --- 2. Merchant Methods (CRUD) ---
+
+exports.createProduct = catchAsync(async (req, res, next) => {
+  const { name, price, category, imageUrls, stock, location } = req.body;
+
+  if (!name || !price || !category || !imageUrls || !stock || !location) {
+    return next(new AppError('Missing required fields', 400));
+  }
+
+  const productData = {
+    ...req.body,
+    sellerId: req.userId,
+    sellerBusinessName: req.userProfile.businessName || req.userProfile.name,
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  };
+
+  const docRef = await db.collection('products').add(productData);
+  await docRef.update({ id: docRef.id });
+
+  // 🛡️ Logic Transfer: Invalidate cache so new product shows up
+  await productCacheService.invalidateProduct(docRef.id, category, req.userId);
+
+  res.status(201).json({ success: true, product: { id: docRef.id, ...productData } });
+});
+
+exports.updateProduct = catchAsync(async (req, res, next) => {
+  const productRef = db.collection('products').doc(req.params.id);
+  const doc = await productRef.get();
+
+  if (!doc.exists) return next(new AppError('Product not found', 404));
+  if (doc.data().sellerId !== req.userId && req.user.role !== 'admin') {
+    return next(new AppError('Unauthorized', 403));
+  }
+
+  const updates = { ...req.body, updatedAt: Date.now() };
+  await productRef.update(updates);
+
+  // Invalidate cache
+  await productCacheService.invalidateProduct(req.params.id, doc.data().category, req.userId);
+
+  res.json({ success: true, message: 'Updated successfully' });
+});
+
+exports.deleteProduct = catchAsync(async (req, res, next) => {
+  const productRef = db.collection('products').doc(req.params.id);
+  const doc = await productRef.get();
+
+  if (!doc.exists) return next(new AppError('Product not found', 404));
+  if (doc.data().sellerId !== req.userId && req.user.role !== 'admin') {
+    return next(new AppError('Unauthorized', 403));
+  }
+
+  await productRef.delete();
+  await productCacheService.invalidateProduct(req.params.id, doc.data().category, req.userId);
+
+  res.json({ success: true, message: 'Deleted successfully' });
+});
+
+// --- 3. Specialized Feeds ---
+
+exports.getProductsBySeller = catchAsync(async (req, res) => {
+  const { page = 1, limit = 20 } = req.query;
+  const result = await productCacheService.getProductsBySeller(req.params.sellerId, parseInt(page), parseInt(limit));
+  res.json({ success: true, ...result });
+});
+
 exports.getSmartFilters = catchAsync(async (req, res) => {
   const { category } = req.query;
   const cacheKey = `filters:${category || 'global'}`;
-
   const cached = await redis.get(cacheKey);
   if (cached) return res.json({ success: true, filters: JSON.parse(cached) });
 
-  let query = db.collection('products');
-  if (category) query = query.where('category', '==', category);
-
-  const snapshot = await query.limit(1000).get();
-  const subcategories = new Set();
-  const states = new Set();
-  const brands = new Set();
+  const snapshot = await db.collection('products').where('category', '==', category).limit(1000).get();
+  const subcategories = new Set(), states = new Set(), brands = new Set();
 
   snapshot.forEach(doc => {
     const p = doc.data();
@@ -53,47 +126,31 @@ exports.getSmartFilters = catchAsync(async (req, res) => {
     if (p.brand) brands.add(p.brand);
   });
 
-  const filters = {
-    subcategories: Array.from(subcategories).sort(),
-    states: Array.from(states).sort(),
-    brands: Array.from(brands).sort()
-  };
-
+  const filters = { subcategories: [...subcategories].sort(), states: [...states].sort(), brands: [...brands].sort() };
   await redis.setEx(cacheKey, 3600, JSON.stringify(filters));
   res.json({ success: true, filters });
 });
 
 exports.getForYouFeed = catchAsync(async (req, res) => {
-  const userId = req.userId;
-  const userProfile = req.userProfile; // Assumes middleware populates this
-  const interests = userProfile?.interests || [];
-  const userState = userProfile?.location?.state;
+  const interests = req.userProfile?.interests || [];
+  const userState = req.userProfile?.location?.state;
 
   let products = [];
   if (interests.length > 0) {
-    const interestSnapshot = await db.collection('products')
-      .where('category', 'in', interests.slice(0, 10))
-      .orderBy('createdAt', 'desc')
-      .limit(20)
-      .get();
-    products = interestSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data(), isRecommendation: true }));
+    const snap = await db.collection('products').where('category', 'in', interests.slice(0, 10)).limit(20).get();
+    products = snap.docs.map(d => ({ id: d.id, ...d.data(), isRecommendation: true }));
   }
 
-  const discoverySnapshot = await db.collection('products')
-    .orderBy('createdAt', 'desc')
-    .limit(20)
-    .get();
+  const discSnap = await db.collection('products').orderBy('createdAt', 'desc').limit(20).get();
+  const discItems = discSnap.docs.map(d => ({ id: d.id, ...d.data() }));
 
-  const discoveryItems = discoverySnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-  const finalFeed = [...products, ...discoveryItems];
-  const uniqueFeed = finalFeed.filter((v, i, a) => a.findIndex(t => t.id === v.id) === i);
+  const uniqueFeed = [...products, ...discItems].filter((v, i, a) => a.findIndex(t => t.id === v.id) === i);
+  uniqueFeed.sort((a, b) => (a.location?.state === userState ? -1 : 1));
 
-  // local state weighting
-  const weightedFeed = uniqueFeed.sort((a, b) => {
-    if (a.location?.state === userState && b.location?.state !== userState) return -1;
-    if (b.location?.state === userState && a.location?.state !== userState) return 1;
-    return 0;
-  });
+  res.json({ success: true, products: uniqueFeed });
+});
 
-  res.json({ success: true, products: weightedFeed });
+exports.warmCache = catchAsync(async (req, res) => {
+  await productCacheService.warmCache(req.body.productIds);
+  res.json({ success: true, message: 'Cache warmed' });
 });
