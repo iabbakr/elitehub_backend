@@ -30,8 +30,8 @@ const upload = multer({
 router.post(
   '/upload-media',
   authenticate,
-  disputeController.canAccess,
-  upload.single('file'),
+  upload.single('file'),       // 1. Multer runs first and fills req.body
+  disputeController.canAccess, // 2. Now canAccess sees orderId in req.body
   disputeController.uploadMedia
 );
 
