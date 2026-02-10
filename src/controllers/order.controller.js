@@ -74,27 +74,19 @@ function getTrackingMessage(status) {
 // 1. GET ORDERS
 // ==========================================
 
-/**
- * GET /api/v1/orders
- * Get user's orders with multi-role support and Redis caching
- */
+// ==========================================
+// 1. GET ORDERS
+// ==========================================
+
 exports.getOrders = catchAsync(async (req, res, next) => {
     const { status, role } = req.query;
     const userId = req.userId;
-
     const cacheKey = `orders:${userId}:${role || 'all'}:${status || 'all'}`;
     const cached = await client.get(cacheKey);
     
-    if (cached) {
-        return res.json({ 
-            success: true, 
-            orders: JSON.parse(cached), 
-            cached: true 
-        });
-    }
+    if (cached) return res.json({ success: true, orders: JSON.parse(cached), cached: true });
 
     let query = db.collection('orders');
-
     if (role === 'buyer') {
         query = query.where('buyerId', '==', userId);
     } else if (role === 'seller') {
@@ -104,67 +96,50 @@ exports.getOrders = catchAsync(async (req, res, next) => {
             db.collection('orders').where('buyerId', '==', userId).get(),
             db.collection('orders').where('sellerId', '==', userId).get()
         ]);
-
-        let orders = [
-            ...buyerSnap.docs.map(doc => ({ id: doc.id, ...doc.data() })),
-            ...sellerSnap.docs.map(doc => ({ id: doc.id, ...doc.data() }))
-        ];
-
+        let orders = [...buyerSnap.docs.map(d => ({id: d.id, ...d.data()})), ...sellerSnap.docs.map(d => ({id: d.id, ...d.data()}))];
         orders = orders.filter((o, i, self) => i === self.findIndex(t => t.id === o.id));
         if (status) orders = orders.filter(o => o.status === status);
         orders.sort((a, b) => b.createdAt - a.createdAt);
-
         await client.setEx(cacheKey, 60, JSON.stringify(orders));
         return res.json({ success: true, orders });
     }
 
     if (status) query = query.where('status', '==', status);
-
     const snapshot = await query.orderBy('createdAt', 'desc').get();
     const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-
     await client.setEx(cacheKey, 60, JSON.stringify(orders));
     res.json({ success: true, orders });
 });
 
-/**
- * GET /api/v1/orders/:orderId
- * Get single order (Buyer, Seller, or Staff)
- */
 exports.getOrder = catchAsync(async (req, res, next) => {
     const { orderId } = req.params;
-    const cacheKey = `order:${orderId}`;
-    
+    const cacheKey = `order_full:${orderId}`;
     const cached = await client.get(cacheKey);
-    let order;
     
-    if (cached) {
-        order = JSON.parse(cached);
-    } else {
-        order = await getDocument('orders', orderId);
-    }
+    if (cached) return res.status(200).json({ success: true, order: JSON.parse(cached), source: 'cache' });
 
-    if (!order) {
-        return next(new AppError('Order not found', 404));
-    }
+    const orderDoc = await db.collection('orders').doc(orderId).get();
+    if (!orderDoc.exists) return next(new AppError('Order not found', 404));
 
-    // Multi-role auth check
-    const isBuyer = order.buyerId === req.userId;
-    const isSeller = order.sellerId === req.userId;
+    const orderData = { id: orderDoc.id, ...orderDoc.data() };
     const isStaff = ['admin', 'support_agent'].includes(req.user?.role);
-
-    if (!isBuyer && !isSeller && !isStaff) {
-        return next(new AppError('Unauthorized: You do not have permission to view this order', 403));
+    if (orderData.buyerId !== req.userId && orderData.sellerId !== req.userId && !isStaff) {
+        return next(new AppError('Unauthorized access', 403));
     }
 
-    if (!cached) {
-        await client.setEx(cacheKey, 300, JSON.stringify(order));
-    }
+    const [buyerSnap, sellerSnap] = await Promise.all([
+        db.collection('users').doc(orderData.buyerId).get(),
+        db.collection('users').doc(orderData.sellerId).get()
+    ]);
 
-    res.status(200).json({
-        success: true,
-        order
-    });
+    const richOrder = {
+        ...orderData,
+        buyerDetails: buyerSnap.exists ? { name: buyerSnap.data().name, phone: buyerSnap.data().phone, imageUrl: buyerSnap.data().imageUrl } : null,
+        sellerDetails: sellerSnap.exists ? { businessName: sellerSnap.data().businessName || sellerSnap.data().name, businessAddress: sellerSnap.data().businessAddress, imageUrl: sellerSnap.data().imageUrl } : null
+    };
+
+    await client.setEx(cacheKey, 120, JSON.stringify(richOrder));
+    res.status(200).json({ success: true, order: richOrder });
 });
 
 // ==========================================
@@ -729,12 +704,16 @@ exports.cancelOrderSeller = catchAsync(async (req, res, next) => {
                 updatedAt: Date.now()
             });
 
-            // Increment strike if order was acknowledged
-            if (order.trackingStatus) {
-                transaction.update(sellerRef, {
-                    autoCancelStrikes: (sellerData.autoCancelStrikes || 0) + 1,
-                    updatedAt: Date.now()
-                });
+            // ⚠️ Automatic Strike: Only if order was already acknowledged
+    if (order.trackingStatus) {
+        transaction.update(sellerRef, {
+            autoCancelStrikes: admin.firestore.FieldValue.increment(1),
+            // Auto-suspend if they hit 3 strikes
+            isSuspended: (sellerData.autoCancelStrikes || 0) + 1 >= 3,
+            suspensionReason: (sellerData.autoCancelStrikes || 0) + 1 >= 3 
+                ? 'Automated suspension: Multiple cancellations after order confirmation' 
+                : null
+        });
             }
         });
 

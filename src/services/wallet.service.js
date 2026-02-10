@@ -659,6 +659,81 @@ class WalletService {
             throw error;
         }
     }
+
+    /**
+ * ✅ ATOMIC DISPUTE RESOLUTION: Release to Seller
+ * Used inside an external db.runTransaction()
+ */
+async releaseEscrowAtomic(transaction, order) {
+    const sellerRef = db.collection('wallets').doc(order.sellerId);
+    const buyerRef = db.collection('wallets').doc(order.buyerId);
+    const sellerAmount = order.totalAmount - order.commission;
+
+    // 1. Credit Seller Balance
+    transaction.update(sellerRef, {
+        balance: admin.firestore.FieldValue.increment(sellerAmount),
+        pendingBalance: admin.firestore.FieldValue.increment(-sellerAmount),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // 2. Remove Buyer Pending
+    transaction.update(buyerRef, {
+        pendingBalance: admin.firestore.FieldValue.increment(-order.totalAmount),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // 3. Create Seller Transaction Log
+    const sellerTxnRef = sellerRef.collection('transactions').doc(`order_${order.id}`);
+    transaction.set(sellerTxnRef, {
+        id: `order_${order.id}`,
+        type: 'credit',
+        category: 'dispute_resolution',
+        amount: sellerAmount,
+        description: `Dispute Won: Order #${order.id.slice(-6).toUpperCase()}`,
+        status: 'completed',
+        timestamp: Date.now(),
+        metadata: { orderId: order.id, resolution: 'release' }
+    }, { merge: true });
+}
+
+/**
+ * ✅ ATOMIC DISPUTE RESOLUTION: Refund to Buyer
+ * Used inside an external db.runTransaction()
+ */
+async refundEscrowAtomic(transaction, order, reason) {
+    const buyerRef = db.collection('wallets').doc(order.buyerId);
+    const sellerRef = db.collection('wallets').doc(order.sellerId);
+    const sellerPendingDeduction = order.totalAmount - order.commission;
+
+    // 1. Credit Buyer Balance
+    transaction.update(buyerRef, {
+        balance: admin.firestore.FieldValue.increment(order.totalAmount),
+        pendingBalance: admin.firestore.FieldValue.increment(-order.totalAmount),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // 2. Remove Seller Pending
+    transaction.update(sellerRef, {
+        pendingBalance: admin.firestore.FieldValue.increment(-sellerPendingDeduction),
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+
+    // 3. Create Buyer Transaction Log
+    const refundTxnId = `refund_${order.id}`;
+    const buyerTxnRef = buyerRef.collection('transactions').doc(refundTxnId);
+    transaction.set(buyerTxnRef, {
+        id: refundTxnId,
+        type: 'credit',
+        category: 'dispute_refund',
+        amount: order.totalAmount,
+        description: `Dispute Refund: Order #${order.id.slice(-6).toUpperCase()}`,
+        status: 'completed',
+        timestamp: Date.now(),
+        metadata: { orderId: order.id, reason }
+    });
+}
+
+    
 }
 
 module.exports = new WalletService();
