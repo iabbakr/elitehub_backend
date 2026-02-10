@@ -45,28 +45,47 @@ exports.getProduct = catchAsync(async (req, res, next) => {
 
 // --- 2. Merchant Methods (CRUD) ---
 
+/**
+ * ✅ BEST PRACTICE: Ownership & Data Integrity
+ */
 exports.createProduct = catchAsync(async (req, res, next) => {
-  const { name, price, category, imageUrls, stock, location } = req.body;
+  const { name, price, category, imageUrls, stock, location, discount } = req.body;
 
-  if (!name || !price || !category || !imageUrls || !stock || !location) {
-    return next(new AppError('Missing required fields', 400));
+  // 1. Validation Logic (Moved to backend to prevent junk data)
+  if (!name || price <= 0 || !category || !imageUrls?.length) {
+    return next(new AppError('Invalid product data. Check price and images.', 400));
   }
 
   const productData = {
-    ...req.body,
-    sellerId: req.userId,
+    name: name.trim(),
+    description: req.body.description || '',
+    price: Number(price),
+    discount: Number(discount || 0),
+    category,
+    subcategory: req.body.subcategory || null,
+    imageUrls,
+    stock: Math.max(0, Number(stock)),
+    location,
+    brand: req.body.brand?.trim() || null,
+    sellerId: req.userId, // 🛡️ Force identification from Auth token
     sellerBusinessName: req.userProfile.businessName || req.userProfile.name,
     createdAt: Date.now(),
-    updatedAt: Date.now()
+    updatedAt: Date.now(),
+    isFeatured: false,
+    status: 'active' // Add status for soft-deletes or admin moderation
   };
 
   const docRef = await db.collection('products').add(productData);
   await docRef.update({ id: docRef.id });
 
-  // 🛡️ Logic Transfer: Invalidate cache so new product shows up
-  await productCacheService.invalidateProduct(docRef.id, category, req.userId);
+  // 🔄 Backend-First: Background cache invalidation
+  // We don't await this so the response is faster for the user
+  productCacheService.invalidateProduct(docRef.id, category, req.userId).catch(console.error);
 
-  res.status(201).json({ success: true, product: { id: docRef.id, ...productData } });
+  res.status(201).json({ 
+    success: true, 
+    product: { id: docRef.id, ...productData } 
+  });
 });
 
 exports.updateProduct = catchAsync(async (req, res, next) => {
@@ -87,19 +106,53 @@ exports.updateProduct = catchAsync(async (req, res, next) => {
   res.json({ success: true, message: 'Updated successfully' });
 });
 
+
+/**
+ * ✅ BEST PRACTICE: Authorization Guard
+ */
+exports.updateProduct = catchAsync(async (req, res, next) => {
+  const productRef = db.collection('products').doc(req.params.id);
+  const doc = await productRef.get();
+
+  if (!doc.exists) return next(new AppError('Product not found', 404));
+  
+  // 🛡️ SECURITY: Verify Ownership
+  const isOwner = doc.data().sellerId === req.userId;
+  const isAdmin = req.user.role === 'admin';
+  
+  if (!isOwner && !isAdmin) {
+    return next(new AppError('Unauthorized: You do not own this product', 403));
+  }
+
+  // 🧹 SANITIZATION: Prevent user from changing sellerId via update
+  const { sellerId, createdAt, ...updates } = req.body;
+  updates.updatedAt = Date.now();
+
+  await productRef.update(updates);
+
+  await productCacheService.invalidateProduct(req.params.id, doc.data().category, req.userId);
+
+  res.json({ success: true, message: 'Product updated successfully' });
+});
+
+
 exports.deleteProduct = catchAsync(async (req, res, next) => {
   const productRef = db.collection('products').doc(req.params.id);
   const doc = await productRef.get();
 
   if (!doc.exists) return next(new AppError('Product not found', 404));
+  
+  // 🛡️ SECURITY: Verify Ownership
   if (doc.data().sellerId !== req.userId && req.user.role !== 'admin') {
-    return next(new AppError('Unauthorized', 403));
+    return next(new AppError('Forbidden: Cannot delete items you do not own', 403));
   }
 
   await productRef.delete();
+  
+  // 🔥 Wipe from cache immediately
   await productCacheService.invalidateProduct(req.params.id, doc.data().category, req.userId);
 
-  res.json({ success: true, message: 'Deleted successfully' });
+  res.json({ success: true, message: 'Product deleted permanently' });
 });
 
 // --- 3. Specialized Feeds ---
