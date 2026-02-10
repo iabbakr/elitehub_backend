@@ -162,25 +162,65 @@ exports.getMediaList = catchAsync(async (req, res) => {
 
 exports.openDispute = catchAsync(async (req, res) => {
   const { orderId, reason, details } = req.body;
+  
   const orderRef = db.collection('orders').doc(orderId);
-  const order = (await orderRef.get()).data();
+  const orderDoc = await orderRef.get();
 
-  // Guard: Only buyer can open dispute, and only if order is 'running'
-  if (order.buyerId !== req.userId) throw new AppError('Only buyers can open disputes', 403);
-  if (order.status !== 'running') throw new AppError('Can only dispute active orders', 400);
+  if (!orderDoc.exists) throw new AppError('Order not found', 404);
+  const order = orderDoc.data();
 
+  // Guard: Only buyer can open dispute
+  if (order.buyerId !== req.userId) {
+    throw new AppError('Only the buyer of this order can initiate a dispute', 403);
+  }
+
+  // Guard: Only if order is 'running'
+  if (order.status !== 'running') {
+    throw new AppError('Disputes can only be opened for active orders', 400);
+  }
+
+  // Guard: Prevent duplicate disputes
+  if (order.disputeStatus === 'open') {
+    throw new AppError('A dispute is already active for this order', 400);
+  }
+
+  // ATOMIC UPDATE
   await orderRef.update({
     disputeStatus: 'open',
     disputeReason: reason,
     disputeDetails: details,
     disputedAt: admin.firestore.FieldValue.serverTimestamp(),
-    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+    // Track that it was opened by buyer for the audit trail
+    disputeOpenedBy: req.userId 
   });
 
-  // Notify Seller and Admins
-  await pushNotificationService.sendDisputeAlert(order.sellerId, 'dispute_opened', orderId);
+  // 1. Notify Seller
+  await pushNotificationService.sendDisputeAlert(order.sellerId, 'dispute_opened', orderId, {
+    title: "Order Disputed ⚠️",
+    body: `The buyer has opened a dispute for order #${orderId.slice(-6).toUpperCase()}.`
+  });
 
-  res.json({ success: true, message: 'Dispute opened successfully' });
+  // 2. Notify All Admins/Support (So they converge)
+  const staffSnapshot = await db.collection('users')
+    .where('role', 'in', ['admin', 'support_agent'])
+    .get();
+
+  const staffIds = staffSnapshot.docs.map(doc => doc.id);
+  await Promise.allSettled(
+    staffIds.map(staffId => 
+      pushNotificationService.sendDisputeAlert(staffId, 'new_dispute_admin', orderId)
+    )
+  );
+
+  // ✅ CRITICAL: Invalidate Admin Dashboard Cache
+  // This ensures the new dispute appears instantly in the Admin list
+  await redis.del('disputes:list:all', 'disputes:list:open');
+
+  res.json({ 
+    success: true, 
+    message: 'Dispute opened. Admin and Seller have been notified.' 
+  });
 });
 
 /**
