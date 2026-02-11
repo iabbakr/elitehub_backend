@@ -195,6 +195,16 @@ exports.openDispute = catchAsync(async (req, res) => {
     disputeOpenedBy: req.userId 
   });
 
+  // 2. ✅ ADD SYSTEM MESSAGE (Bypasses Frontend Permission Issues)
+  await orderRef.collection('disputeChat').add({
+    senderId: 'system',
+    senderRole: 'admin',
+    message: `🚨 DISPUTE OPENED. \n\nBuyer: ${req.userProfile.name} has requested admin review. Admin and Support have been alerted. Please provide evidence below.`,
+    timestamp: Date.now()
+  });
+
+  await redis.del('disputes:list:all', 'disputes:list:open');
+  
   // 1. Notify Seller
   await pushNotificationService.sendDisputeAlert(order.sellerId, 'dispute_opened', orderId, {
     title: "Order Disputed ⚠️",
