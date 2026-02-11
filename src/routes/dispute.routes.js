@@ -26,15 +26,15 @@ const upload = multer({
  * All routes require authentication and order participation
  */
 
-// ✅ To this:
+// ✅ FIXED: Open dispute (buyer only, after seller confirms)
 router.post('/open', authenticate, disputeController.openDispute);
 
-// Upload evidence/media to dispute
+// ✅ FIXED: Upload media - multer runs first, then canAccess sees orderId in body
 router.post(
   '/upload-media',
   authenticate,
-  upload.single('file'),       // 1. Multer runs first and fills req.body
-  disputeController.canAccess, // 2. Now canAccess sees orderId in req.body
+  upload.single('file'),       // 1. Multer populates req.body and req.file
+  disputeController.canAccess, // 2. Now orderId is in req.body
   disputeController.uploadMedia
 );
 
@@ -46,7 +46,7 @@ router.post(
   disputeController.notifyNewMessage
 );
 
-// Get all media for a dispute
+// ✅ NEW: Get all media for a dispute (with pagination)
 router.get(
   '/:orderId/media',
   authenticate,
@@ -68,7 +68,7 @@ router.get(
  */
 router.use(authenticate, adminOrSupport);
 
-// Get all disputes (with filtering and caching)
+// ✅ FIXED: Get all disputes with pagination
 router.get('/', disputeController.getAllDisputes);
 
 // Resolve dispute (atomic wallet operation)
