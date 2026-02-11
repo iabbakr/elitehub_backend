@@ -26,6 +26,9 @@ const upload = multer({
  * All routes require authentication and order participation
  */
 
+// ✅ To this:
+router.post('/open', authenticate, disputeController.openDispute);
+
 // Upload evidence/media to dispute
 router.post(
   '/upload-media',
