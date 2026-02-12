@@ -1,3 +1,4 @@
+// services/seller-review.service.js - FIXED VERSION
 const { db, admin } = require('../config/firebase');
 const { client } = require('../config/redis');
 
@@ -16,51 +17,91 @@ const CACHE_TTL = {
 
 class SellerReviewService {
     /**
-     * ✅ Submit seller review (Production Grade)
-     * Fixed: Lifetime average rating math
-     * Fixed: Automated counters
+     * ✅ FIXED: Submit seller review with better validation
      */
-    
     async submitSellerReview(sellerId, buyerId, orderId, buyerName, rating, comment) {
         const lockKey = `seller_review:lock:${orderId}:${buyerId}`;
 
         try {
-        // 1️⃣ Security & Validity Checks
-        const orderDoc = await db.collection('orders').doc(orderId).get();
-        if (!orderDoc.exists) throw new Error('Order not found');
+            console.log('🔍 Starting review submission:', {
+                sellerId,
+                buyerId,
+                orderId,
+                rating
+            });
 
-        const order = orderDoc.data();
-        if (order.buyerId !== buyerId) throw new Error('Unauthorized');
-        if (order.sellerId !== sellerId) throw new Error('Seller mismatch');
-        if (order.status !== 'delivered') throw new Error('You can only review delivered orders');
-        if (order.hasSellerReview) throw new Error('This order has already been reviewed');
-        
-        // --- 🛠️ MODIFIED BLOCK ---
-        const thirtyDays = 30 * 24 * 60 * 60 * 1000;
-        
-        // Use a fallback: if deliveredAt isn't populated yet, use updatedAt or current time
-        // This ensures "immediate" reviews don't fail if the timestamp is still null
-        const deliveryTime = order.deliveredAt ? 
-            (order.deliveredAt._seconds ? order.deliveredAt._seconds * 1000 : order.deliveredAt) : 
-            (order.updatedAt || Date.now());
+            // 1️⃣ Security & Validity Checks
+            const orderDoc = await db.collection('orders').doc(orderId).get();
+            
+            if (!orderDoc.exists) {
+                console.error('❌ Order not found:', orderId);
+                throw new Error('Order not found');
+            }
 
-        const timeElapsed = Date.now() - deliveryTime;
+            const order = orderDoc.data();
 
-        if (timeElapsed > thirtyDays) {
-            throw new Error('Review window has expired (30 days limit)');
-        }
-        
-        // Optional: Block reviews that are "too fresh" only if you suspect clock skew, 
-        // but generally, allow if timeElapsed is >= 0.
-        if (timeElapsed < -60000) { // Allow for 1 min clock skew
-             throw new Error('Invalid delivery timestamp');
-        }
-        // --- 🛠️ END MODIFIED BLOCK ---
+            console.log('📋 Order data:', {
+                status: order.status,
+                buyerId: order.buyerId,
+                sellerId: order.sellerId,
+                hasReview: order.hasSellerReview
+            });
 
-        // 2️⃣ Concurrency Lock
-        const isLocked = await client.get(lockKey);
-        if (isLocked) throw new Error('Processing review, please wait...');
-        await client.setEx(lockKey, 30, 'processing');
+            // Validate buyer ownership
+            if (order.buyerId !== buyerId) {
+                console.error('❌ Unauthorized: Buyer mismatch', {
+                    orderBuyerId: order.buyerId,
+                    requestBuyerId: buyerId
+                });
+                throw new Error('Unauthorized: You can only review your own orders');
+            }
+
+            // Validate seller match
+            if (order.sellerId !== sellerId) {
+                console.error('❌ Seller mismatch', {
+                    orderSellerId: order.sellerId,
+                    requestSellerId: sellerId
+                });
+                throw new Error('Seller ID does not match order');
+            }
+
+            // Check order status
+            if (order.status !== 'delivered') {
+                console.error('❌ Order not delivered:', order.status);
+                throw new Error('You can only review delivered orders');
+            }
+
+            // Check if already reviewed
+            if (order.hasSellerReview) {
+                console.error('❌ Order already reviewed');
+                throw new Error('This order has already been reviewed');
+            }
+            
+            // ✅ FIXED: Handle delivery timestamp properly
+            const thirtyDays = 30 * 24 * 60 * 60 * 1000;
+            
+            // Use deliveredAt if available, otherwise fall back to updatedAt
+            const deliveryTime = order.deliveredAt ? 
+                (order.deliveredAt._seconds ? order.deliveredAt._seconds * 1000 : order.deliveredAt) : 
+                (order.updatedAt || Date.now());
+
+            const timeElapsed = Date.now() - deliveryTime;
+
+            if (timeElapsed > thirtyDays) {
+                throw new Error('Review window has expired (30 days limit)');
+            }
+            
+            // Allow 1 minute clock skew
+            if (timeElapsed < -60000) {
+                throw new Error('Invalid delivery timestamp');
+            }
+
+            // 2️⃣ Concurrency Lock
+            const isLocked = await client.get(lockKey);
+            if (isLocked) {
+                throw new Error('Processing review, please wait...');
+            }
+            await client.setEx(lockKey, 30, 'processing');
 
             const sellerRef = db.collection('users').doc(sellerId);
             const reviewsCol = db.collection('seller_reviews');
@@ -68,16 +109,27 @@ class SellerReviewService {
             // 3️⃣ Atomic Transaction
             const result = await db.runTransaction(async (transaction) => {
                 const sellerDoc = await transaction.get(sellerRef);
-                if (!sellerDoc.exists) throw new Error('Seller not found');
+                
+                if (!sellerDoc.exists) {
+                    throw new Error('Seller not found');
+                }
 
                 const sellerData = sellerDoc.data();
                 
-                // Calculate Lifetime cumulative average
+                // ✅ Calculate Lifetime cumulative average
                 const oldTotalSum = sellerData.totalRatingSum || 0;
                 const oldTotalCount = sellerData.totalReviews || 0;
                 const newTotalSum = oldTotalSum + rating;
                 const newTotalCount = oldTotalCount + 1;
                 const globalAverage = parseFloat((newTotalSum / newTotalCount).toFixed(1));
+
+                console.log('📊 Rating calculation:', {
+                    oldAverage: sellerData.rating,
+                    oldCount: oldTotalCount,
+                    newRating: rating,
+                    newAverage: globalAverage,
+                    newCount: newTotalCount
+                });
 
                 // Create Review
                 const newReviewRef = reviewsCol.doc();
@@ -98,6 +150,7 @@ class SellerReviewService {
                 transaction.update(db.collection('orders').doc(orderId), {
                     hasSellerReview: true,
                     reviewedAt: Date.now(),
+                    updatedAt: Date.now()
                 });
 
                 // Update Seller Profile
@@ -108,7 +161,11 @@ class SellerReviewService {
                     updatedAt: admin.firestore.FieldValue.serverTimestamp(),
                 });
 
-                return { reviewId: newReviewRef.id, globalAverage };
+                return { 
+                    reviewId: newReviewRef.id, 
+                    globalAverage,
+                    totalReviews: newTotalCount
+                };
             });
 
             // 4️⃣ Cleanup & Invalidation
@@ -118,8 +175,11 @@ class SellerReviewService {
                 client.del(lockKey)
             ]);
 
+            console.log('✅ Review submitted successfully:', result);
+
             return result;
         } catch (error) {
+            console.error('❌ Review submission failed:', error);
             await client.del(lockKey);
             throw error;
         }
@@ -137,15 +197,15 @@ class SellerReviewService {
             const followDoc = await transaction.get(followRef);
 
             if (action === 'follow') {
-                if (followDoc.exists()) return; // Already following
+                if (followDoc.exists) return; // Already following
                 transaction.set(followRef, { userId, sellerId, createdAt: Date.now() });
                 transaction.update(sellerRef, { followerCount: admin.firestore.FieldValue.increment(1) });
                 transaction.update(userRef, { favoriteProviders: admin.firestore.FieldValue.arrayUnion(sellerId) });
             } else {
-                if (!followDoc.exists()) return; // Not following
+                if (!followDoc.exists) return; // Not following
                 transaction.delete(followRef);
                 transaction.update(sellerRef, { followerCount: admin.firestore.FieldValue.increment(-1) });
-                transaction.update(userRef, { favoriteProviders: admin.firestore.FieldValue.arrayUnion(sellerId) });
+                transaction.update(userRef, { favoriteProviders: admin.firestore.FieldValue.arrayRemove(sellerId) });
             }
         });
 
@@ -161,13 +221,10 @@ class SellerReviewService {
         if (cached) return JSON.parse(cached);
 
         const sellerDoc = await db.collection('users').doc(sellerId).get();
-    
-    // Use this pattern to be 100% safe
-    const exists = typeof sellerDoc.exists === 'function' ? sellerDoc.exists() : sellerDoc.exists;
-    
-    if (!exists) {
-        throw new Error('Seller not found');
-    }
+        
+        if (!sellerDoc.exists) {
+            throw new Error('Seller not found');
+        }
         
         const data = sellerDoc.data();
         const productsSnap = await db.collection('products')
@@ -190,6 +247,7 @@ class SellerReviewService {
         await client.setEx(cacheKey, CACHE_TTL.STATS, JSON.stringify(stats));
         return stats;
     }
+
     /**
      * ✅ Get seller rating with counters
      */
