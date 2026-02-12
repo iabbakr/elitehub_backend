@@ -23,7 +23,11 @@ const { db } = require('./src/config/firebase');
 // Background Jobs
 require('./src/jobs/orderCleanup');
 require('./src/jobs/keepAlive');
-require('./src/jobs/cartReminder'); // ✅ ADD THIS LINE
+require('./src/jobs/cartReminder'); 
+require('./src/jobs/disputeCleanup');
+
+const xss = require('xss-clean');
+const hpp = require('hpp');
 
 // Middleware Imports
 const maintenanceGuard = require('./src/middleware/maintenance');
@@ -49,6 +53,8 @@ const app = express();
 
 app.set('trust proxy', 1);
 
+
+
 // --- 1. Security & Performance Middleware ---
 app.use(helmet({
   contentSecurityPolicy: {
@@ -66,9 +72,14 @@ app.use(helmet({
   }
 }));
 
+app.use(xss());
+app.use(hpp({      // Prevent HTTP Parameter Pollution
+  whitelist: ['price', 'category', 'rating', 'stock', 'status'] 
+}));
+
 app.use(cors({
   origin: process.env.NODE_ENV === 'production' 
-    ? ['https://elitehubng.com', 'https://www.elitehubng.com']
+    ? ['https://elitehubng.com', 'https://www.elitehubng.com', "https://www.elitehubng.com", "https://www.elitehubng.com/"]
     : ['http://localhost:8081', 'http://192.168.100.142:8081', '*'],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
