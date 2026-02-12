@@ -10,15 +10,27 @@ const EmailService = require('../services/email.service');
  */
 exports.sendWelcomeEmail = catchAsync(async (req, res) => {
     const { email, name, role } = req.body;
-    if (!email || !name || !role) throw new AppError('Missing required fields', 400);
+    
+    // Detailed validation logging
+    console.log(`Attempting welcome email for ${email} as ${role}`);
 
-    switch (role) {
-        case 'seller': await EmailService.sendSellerWelcomeEmail(email, name); break;
-        case 'service': await EmailService.sendServiceWelcomeEmail(email, name); break;
-        default: await EmailService.sendBuyerWelcomeEmail(email, name); break;
+    try {
+        let result;
+        switch (role) {
+            case 'seller': result = await EmailService.sendSellerWelcomeEmail(email, name); break;
+            case 'service': result = await EmailService.sendServiceWelcomeEmail(email, name); break;
+            default: result = await EmailService.sendBuyerWelcomeEmail(email, name); break;
+        }
+
+        if (!result) {
+            return res.status(500).json({ success: false, message: 'Email service failed' });
+        }
+
+        res.status(200).json({ success: true, message: 'Welcome email sent' });
+    } catch (err) {
+        console.error("RESEND ERROR:", err.message);
+        throw new AppError(`Email failed: ${err.message}`, 500);
     }
-
-    res.status(200).json({ success: true, message: 'Welcome email sent' });
 });
 
 /**
