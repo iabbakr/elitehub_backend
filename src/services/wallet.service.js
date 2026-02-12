@@ -426,138 +426,141 @@ class WalletService {
      * ✅ CRITICAL FIX: Safe transaction update with existence check
      * Uses set with merge option instead of update to handle missing docs
      */
-    async releaseEscrow(orderId, buyerId, sellerId, totalAmount, commission) {
-        const lockKey = `release:lock:${orderId}`;
-        const sellerAmount = totalAmount - commission;
+   /**
+ * ✅ CRITICAL FIX: Safe transaction update with existence check
+ */
+async releaseEscrow(orderId, buyerId, sellerId, totalAmount, commission) {
+    const lockKey = `release:lock:${orderId}`;
+    const sellerAmount = totalAmount - commission;
 
-        try {
-            const isProcessed = await client.get(lockKey);
-            if (isProcessed) return { success: true, alreadyProcessed: true };
+    try {
+        const isProcessed = await client.get(lockKey);
+        if (isProcessed) return { success: true, alreadyProcessed: true };
 
-            await client.setEx(lockKey, 86400, 'true');
+        await client.setEx(lockKey, 86400, 'true');
 
-            const sellerRef = db.collection('wallets').doc(sellerId);
-            const buyerRef = db.collection('wallets').doc(buyerId);
-            const orderRef = db.collection('orders').doc(orderId);
-            const buyerOriginalTxnRef = buyerRef.collection('transactions').doc(`pay_${orderId}`);
+        const sellerRef = db.collection('wallets').doc(sellerId);
+        const buyerRef = db.collection('wallets').doc(buyerId);
+        const orderRef = db.collection('orders').doc(orderId);
+        const buyerOriginalTxnRef = buyerRef.collection('transactions').doc(`pay_${orderId}`);
 
-            const result = await db.runTransaction(async (transaction) => {
-                // ==========================================
-                // PHASE 1: ALL READS FIRST ✅
-                // ==========================================
-                const sellerTxnRef = sellerRef.collection('transactions').doc(`order_${orderId}`);
-                
-                const [orderDoc, sellerDoc, buyerDoc, buyerTxnSnap, sellerTxnSnap] = await Promise.all([
-                    transaction.get(orderRef),
-                    transaction.get(sellerRef),
-                    transaction.get(buyerRef),
-                    transaction.get(buyerOriginalTxnRef),
-                    transaction.get(sellerTxnRef) // ✅ Check if seller txn exists
-                ]);
-
-                if (!orderDoc.exists) throw new Error("Order not found");
-                const orderData = orderDoc.data();
-                
-                if (orderData.status === 'delivered') return { success: true, alreadyProcessed: true };
-                if (orderData.status !== 'running') throw new Error(`Invalid order status: ${orderData.status}`);
-                if (!sellerDoc.exists || !buyerDoc.exists) throw new Error("Wallet not found");
-
-                // ==========================================
-                // PHASE 2: ALL WRITES AFTER ✅
-                // ==========================================
-                
-                // 1. Update Order Status
-                transaction.update(orderRef, {
-                    status: 'delivered',
-                    buyerConfirmed: true,
-                    deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                // 2. Update Buyer's Original Payment
-                if (buyerTxnSnap.exists) {
-                    transaction.update(buyerOriginalTxnRef, {
-                        status: 'completed',
-                        description: `Order #${orderId.slice(-6).toUpperCase()} - Completed`,
-                        completedAt: Date.now(),
-                        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                    });
-                }
-
-                // 3. ✅ FIX: Update or Create seller transaction (safe operation)
-                if (sellerTxnSnap.exists) {
-                    // Transaction exists - UPDATE it
-                    transaction.update(sellerTxnRef, {
-                        status: 'completed',
-                        category: 'order_release',
-                        description: `Order #${orderId.slice(-6).toUpperCase()} - Payment Released`,
-                        completedAt: Date.now(),
-                        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                    });
-                } else {
-                    // Transaction doesn't exist - CREATE it (fallback for old orders)
-                    console.warn(`⚠️ Seller transaction not found for order ${orderId}, creating new one`);
-                    transaction.set(sellerTxnRef, {
-                        id: `order_${orderId}`,
-                        userId: sellerId,
-                        type: 'credit',
-                        category: 'order_release',
-                        amount: sellerAmount,
-                        description: `Order #${orderId.slice(-6).toUpperCase()} - Payment Released`,
-                        timestamp: Date.now(),
-                        status: 'completed',
-                        completedAt: Date.now(),
-                        metadata: { 
-                            orderId, 
-                            commission,
-                            paymentType: 'order_released',
-                            reference: `order_${orderId}`,
-                            fallbackCreated: true // Flag to identify these
-                        }
-                    });
-                }
-
-                // 4. Update Balances
-                transaction.update(sellerRef, {
-                    balance: admin.firestore.FieldValue.increment(sellerAmount),
-                    pendingBalance: admin.firestore.FieldValue.increment(-sellerAmount),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                transaction.update(buyerRef, {
-                    pendingBalance: admin.firestore.FieldValue.increment(-totalAmount),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                return { success: true, alreadyProcessed: false, amount: sellerAmount };
-            });
-
-            await this.invalidateWalletCache(sellerId);
-            await this.invalidateWalletCache(buyerId);
-
-            await Promise.allSettled([
-                pushNotificationService.sendPushToUser(
-                    buyerId,
-                    "Order Completed! 🛍️",
-                    `Your order #${orderId.slice(-6).toUpperCase()} has been finalized.`,
-                    { screen: "OrdersTab" }
-                ),
-                pushNotificationService.sendPushToUser(
-                    sellerId,
-                    "💸 Payment Released",
-                    `₦${sellerAmount.toLocaleString()} has been added to your balance.`,
-                    { screen: "OrdersTab" }
-                )
+        const result = await db.runTransaction(async (transaction) => {
+            // ==========================================
+            // PHASE 1: ALL READS FIRST ✅
+            // ==========================================
+            const sellerTxnRef = sellerRef.collection('transactions').doc(`order_${orderId}`);
+            
+            const [orderDoc, sellerDoc, buyerDoc, buyerTxnSnap, sellerTxnSnap] = await Promise.all([
+                transaction.get(orderRef),
+                transaction.get(sellerRef),
+                transaction.get(buyerRef),
+                transaction.get(buyerOriginalTxnRef),
+                transaction.get(sellerTxnRef) // ✅ Check if seller txn exists
             ]);
 
-            return result;
+            if (!orderDoc.exists) throw new Error("Order not found");
+            const orderData = orderDoc.data();
+            
+            if (orderData.status === 'delivered') return { success: true, alreadyProcessed: true };
+            if (orderData.status !== 'running') throw new Error(`Invalid order status: ${orderData.status}`);
+            if (!sellerDoc.exists || !buyerDoc.exists) throw new Error("Wallet not found");
 
-        } catch (error) {
-            console.error(`❌ Release escrow error:`, error);
-            if (!error.message?.includes('delivered')) await client.del(lockKey);
-            throw error;
-        }
+            // ==========================================
+            // PHASE 2: ALL WRITES AFTER ✅
+            // ==========================================
+            
+            // 1. Update Order Status
+            transaction.update(orderRef, {
+                status: 'delivered',
+                buyerConfirmed: true,
+                deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            // 2. Update Buyer's Original Payment
+            if (buyerTxnSnap.exists) {
+                transaction.update(buyerOriginalTxnRef, {
+                    status: 'completed',
+                    description: `Order #${orderId.slice(-6).toUpperCase()} - Completed`,
+                    completedAt: Date.now(),
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+            }
+
+            // 3. ✅ FIX: Use set with merge instead of update
+            if (sellerTxnSnap.exists) {
+                // Transaction exists - UPDATE it
+                transaction.update(sellerTxnRef, {
+                    status: 'completed',
+                    category: 'order_release',
+                    description: `Order #${orderId.slice(-6).toUpperCase()} - Payment Released`,
+                    completedAt: Date.now(),
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+            } else {
+                // Transaction doesn't exist - CREATE it (fallback for old orders)
+                console.warn(`⚠️ Seller transaction not found for order ${orderId}, creating new one`);
+                transaction.set(sellerTxnRef, {
+                    id: `order_${orderId}`,
+                    userId: sellerId,
+                    type: 'credit',
+                    category: 'order_release',
+                    amount: sellerAmount,
+                    description: `Order #${orderId.slice(-6).toUpperCase()} - Payment Released`,
+                    timestamp: Date.now(),
+                    status: 'completed',
+                    completedAt: Date.now(),
+                    metadata: { 
+                        orderId, 
+                        commission,
+                        paymentType: 'order_released',
+                        reference: `order_${orderId}`,
+                        fallbackCreated: true
+                    }
+                });
+            }
+
+            // 4. Update Balances
+            transaction.update(sellerRef, {
+                balance: admin.firestore.FieldValue.increment(sellerAmount),
+                pendingBalance: admin.firestore.FieldValue.increment(-sellerAmount),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            transaction.update(buyerRef, {
+                pendingBalance: admin.firestore.FieldValue.increment(-totalAmount),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            return { success: true, alreadyProcessed: false, amount: sellerAmount };
+        });
+
+        await this.invalidateWalletCache(sellerId);
+        await this.invalidateWalletCache(buyerId);
+
+        await Promise.allSettled([
+            pushNotificationService.sendPushToUser(
+                buyerId,
+                "Order Completed! 🛍️",
+                `Your order #${orderId.slice(-6).toUpperCase()} has been finalized.`,
+                { screen: "OrdersTab" }
+            ),
+            pushNotificationService.sendPushToUser(
+                sellerId,
+                "💸 Payment Released",
+                `₦${sellerAmount.toLocaleString()} has been added to your balance.`,
+                { screen: "OrdersTab" }
+            )
+        ]);
+
+        return result;
+
+    } catch (error) {
+        console.error(`❌ Release escrow error:`, error);
+        if (!error.message?.includes('delivered')) await client.del(lockKey);
+        throw error;
     }
+}
 
     /**
      * ✅ FIXED: Safe refund with proper transaction handling
