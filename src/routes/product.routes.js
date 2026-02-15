@@ -2,6 +2,14 @@ const express = require('express');
 const router = express.Router();
 const productController = require('../controllers/product.controller');
 const { authenticate, sellerOrAdmin, optionalAuth } = require('../middleware/auth');
+const rateLimit = require('express-rate-limit');
+
+// 🛡️ Rate limiter for merchant actions (e.g., 20 products per 15 mins)
+const merchantLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  message: { success: false, message: 'Too many product uploads, please try again later' }
+});
 
 /**
  * 📦 PRODUCT ROUTES - BACKEND-FIRST ARCHITECTURE

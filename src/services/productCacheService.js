@@ -2,6 +2,7 @@
 const { getCache, setCache, deleteCache, deleteCachePattern, CACHE_KEYS, CACHE_TTL } = require('../config/redis');
 const { db } = require('../config/firebase');
 const cdnService = require('./cdn.service');
+const crypto = require('crypto');
 
 /**
  * PRODUCT CACHE SERVICE
@@ -172,17 +173,36 @@ class ProductCacheService {
   }
 
   /**
+ * 🛡️ SENIOR MOVE: Atomic Pattern Invalidation
+ * Instead of slow SCAN patterns, we use a central versioning key for categories.
+ */
+async getCategoryVersion(category) {
+  const versionKey = `version:category:${category}`;
+  let version = await getCache(versionKey);
+  if (!version) {
+    version = Date.now().toString();
+    await setCache(versionKey, version, CACHE_TTL.LONG);
+  }
+  return version;
+}
+  
+
+  /**
    * Search products with caching
    */
   
   async searchProducts(query, filters = {}) {
+  try {
     const { category, minPrice, maxPrice, state } = filters;
     
-    // 🛡️ SENIOR MOVE: Dynamic Cache Key for specific filter combinations
+    // Hash filter combinations to prevent key collisions
     const filterHash = crypto.createHash('md5')
-      .update(JSON.stringify({category, minPrice, maxPrice, state}))
+      .update(JSON.stringify({ category, minPrice, maxPrice, state }))
       .digest('hex');
-    const cacheKey = `search:${query || 'none'}:${filterHash}`;
+    
+    // Include the category version in the key so updates auto-invalidate searches
+    const version = category ? await this.getCategoryVersion(category) : 'v1';
+    const cacheKey = `search:${version}:${query || 'none'}:${filterHash}`;
 
     const cached = await getCache(cacheKey);
     if (cached) return cached;
@@ -224,6 +244,7 @@ class ProductCacheService {
       console.error('Search products error:', error);
       throw error;
     }
+  }
   
 
   /**

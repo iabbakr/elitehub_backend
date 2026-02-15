@@ -1,7 +1,6 @@
 // services/review.service.js - PRODUCTION-GRADE REVIEW SYSTEM
 const { db, admin } = require('../config/firebase');
 const { client } = require('../config/redis');
-const AsyncStorage = require('@react-native-async-storage/async-storage');
 
 /**
  * ✅ PRODUCTION-GRADE REVIEW SERVICE

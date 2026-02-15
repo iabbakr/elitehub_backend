@@ -6,6 +6,15 @@ const { Resend } = require('resend');
  */
 const resend = new Resend(process.env.RESEND_API_KEY);
 
+
+if (!process.env.RESEND_API_KEY) {
+  console.error('❌ RESEND_API_KEY is missing in .env file');
+  process.exit(1);
+}
+
+console.log('✅ Resend initialized with API key:', 
+  process.env.RESEND_API_KEY.substring(0, 10) + '...'
+);
 /**
  * The sender address. 
  * Note: Until your domain is verified in the Resend dashboard,

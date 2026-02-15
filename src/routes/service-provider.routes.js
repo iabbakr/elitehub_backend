@@ -1,0 +1,215 @@
+// routes/service-provider.routes.js - BACKEND ROUTES
+const express = require('express');
+const router = express.Router();
+const { authenticate, userRateLimit } = require('../middleware/auth');
+const { cacheMiddleware } = require('../middleware/cache');
+const serviceProviderService = require('../services/service-provider.service');
+const reviewService = require('../services/review.service');
+const catchAsync = require('../utils/catchAsync');
+const AppError = require('../utils/AppError');
+
+/**
+ * GET /api/v1/service-providers/category/:category
+ * Get providers by category with caching
+ */
+router.get(
+    '/category/:category',
+    cacheMiddleware(300), // 5 minutes
+    catchAsync(async (req, res) => {
+        const { category } = req.params;
+        const { state, city, area, userId } = req.query;
+
+        const providers = await serviceProviderService.getProvidersByCategory(category, {
+            state,
+            city,
+            area,
+            currentUserId: userId
+        });
+
+        res.json({
+            success: true,
+            providers,
+            count: providers.length
+        });
+    })
+);
+
+/**
+ * GET /api/v1/service-providers/:providerId
+ * Get provider profile with view tracking
+ */
+router.get(
+    '/:providerId',
+    catchAsync(async (req, res) => {
+        const { providerId } = req.params;
+        const viewerId = req.query.viewerId;
+
+        const profile = await serviceProviderService.getProviderProfile(providerId, viewerId);
+
+        res.json({
+            success: true,
+            provider: profile
+        });
+    })
+);
+
+/**
+ * GET /api/v1/service-providers/:providerId/reviews
+ * Get provider reviews with caching
+ */
+router.get(
+    '/:providerId/reviews',
+    cacheMiddleware(180), // 3 minutes
+    catchAsync(async (req, res) => {
+        const { providerId } = req.params;
+
+        const reviews = await serviceProviderService.getProviderReviews(providerId);
+
+        res.json({
+            success: true,
+            reviews,
+            count: reviews.length
+        });
+    })
+);
+
+/**
+ * POST /api/v1/service-providers/:providerId/review
+ * Submit review with validation
+ */
+router.post(
+    '/:providerId/review',
+    authenticate,
+    userRateLimit(3, 60 * 60 * 1000), // 3 reviews per hour max
+    catchAsync(async (req, res, next) => {
+        const { providerId } = req.params;
+        const { rating, comment } = req.body;
+        const userId = req.userId;
+        const userName = req.userProfile?.name || 'Anonymous';
+
+        // ✅ CRITICAL: Prevent self-review
+        if (userId === providerId) {
+            return next(new AppError('You cannot review yourself', 400));
+        }
+
+        // ✅ CRITICAL: Prevent service providers from reviewing
+        if (req.userProfile?.role === 'service') {
+            return next(new AppError('Service providers cannot submit reviews', 403));
+        }
+
+        // Validation
+        if (!rating || rating < 1 || rating > 5) {
+            return next(new AppError('Rating must be between 1 and 5', 400));
+        }
+
+        if (!comment || comment.trim().length < 10) {
+            return next(new AppError('Comment must be at least 10 characters', 400));
+        }
+
+        // Submit review
+        const result = await reviewService.submitReview(
+            providerId,
+            userId,
+            userName,
+            rating,
+            comment
+        );
+
+        // Send notification to provider
+        const { pushNotificationService } = require('../services/push-notification.service');
+        await pushNotificationService.sendPushToUser(
+            providerId,
+            "⭐ New Review!",
+            `${userName} rated you ${rating} stars`,
+            { screen: "ServiceProviderDashboard" }
+        );
+
+        res.json({
+            success: true,
+            message: 'Review submitted successfully',
+            data: result
+        });
+    })
+);
+
+/**
+ * POST /api/v1/service-providers/subscribe
+ * Subscribe to service
+ */
+router.post(
+    '/subscribe',
+    authenticate,
+    userRateLimit(5, 15 * 60 * 1000),
+    catchAsync(async (req, res, next) => {
+        const { plan } = req.body;
+        const providerId = req.userId;
+
+        // Validate user is a service provider
+        if (req.userProfile?.role !== 'service') {
+            return next(new AppError('Only service providers can subscribe', 403));
+        }
+
+        const result = await serviceProviderService.subscribe(providerId, plan);
+
+        res.json(result);
+    })
+);
+
+/**
+ * GET /api/v1/service-providers/subscription/status
+ * Get subscription status
+ */
+router.get(
+    '/subscription/status',
+    authenticate,
+    catchAsync(async (req, res) => {
+        const providerId = req.userId;
+
+        const status = await serviceProviderService.getSubscriptionStatus(providerId);
+
+        res.json({
+            success: true,
+            subscription: status
+        });
+    })
+);
+
+/**
+ * POST /api/v1/service-providers/share/:providerId
+ * Generate share link
+ */
+router.post(
+    '/share/:providerId',
+    catchAsync(async (req, res) => {
+        const { providerId } = req.params;
+        const { platform } = req.body;
+
+        const provider = await serviceProviderService.getProviderProfile(providerId);
+
+        const shareUrl = `https://elitehubng.com/service-provider/${providerId}`;
+        const message = `Check out ${provider.businessName} on EliteHub! ${provider.serviceDescription || ''}`;
+
+        let platformUrl;
+        switch (platform) {
+            case 'whatsapp':
+                platformUrl = `https://wa.me/?text=${encodeURIComponent(`${message} ${shareUrl}`)}`;
+                break;
+            case 'facebook':
+                platformUrl = `https://www.facebook.com/sharer/sharer.php?u=${encodeURIComponent(shareUrl)}`;
+                break;
+            case 'twitter':
+                platformUrl = `https://twitter.com/intent/tweet?text=${encodeURIComponent(message)}&url=${encodeURIComponent(shareUrl)}`;
+                break;
+            default:
+                platformUrl = shareUrl;
+        }
+
+        res.json({
+            success: true,
+            shareUrl: platformUrl,
+            message
+        });
+    })
+);
+
+module.exports = router;
