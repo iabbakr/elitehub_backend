@@ -1,4 +1,4 @@
-// routes/service-provider.routes.js - BACKEND ROUTES
+// routes/service-provider.routes.js - BACKEND ROUTES (CLEAN)
 const express = require('express');
 const router = express.Router();
 const { authenticate, userRateLimit } = require('../middleware/auth');
@@ -116,7 +116,7 @@ router.post(
         );
 
         // Send notification to provider
-        const { pushNotificationService } = require('../services/push-notification.service');
+        const pushNotificationService = require('../services/push-notification.service');
         await pushNotificationService.sendPushToUser(
             providerId,
             "⭐ New Review!",
@@ -170,6 +170,31 @@ router.get(
         res.json({
             success: true,
             subscription: status
+        });
+    })
+);
+
+/**
+ * POST /api/v1/service-providers/track-view/:providerId
+ * Track profile view
+ */
+router.post(
+    '/track-view/:providerId',
+    authenticate,
+    catchAsync(async (req, res) => {
+        const { providerId } = req.params;
+        const userId = req.userId;
+
+        // Don't track self-views
+        if (userId === providerId) {
+            return res.json({ success: true, tracked: false });
+        }
+
+        const result = await serviceProviderService._trackProfileView(providerId, userId);
+
+        res.json({
+            success: true,
+            tracked: result
         });
     })
 );
