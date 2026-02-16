@@ -1,4 +1,4 @@
-// routes/user.routes.js - MERGED CLEAN VERSION
+// routes/user.routes.js - FIXED VERSION
 const express = require('express');
 const router = express.Router();
 const userController = require('../controllers/user.controller');
@@ -79,6 +79,7 @@ router.post(
 /**
  * GET /api/v1/users/favorites/:userId
  * Get user's favorite providers
+ * ✅ FIXED: Changed .exists() to .exists (property, not method)
  */
 router.get(
     '/favorites/:userId',
@@ -95,7 +96,8 @@ router.get(
 
         const userDoc = await db.collection('users').doc(userId).get();
         
-        if (!userDoc.exists()) {
+        // ✅ FIX: .exists is a PROPERTY, not a METHOD
+        if (!userDoc.exists) {
             return res.status(404).json({
                 success: false,
                 message: 'User not found'
