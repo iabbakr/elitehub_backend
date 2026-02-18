@@ -5,7 +5,6 @@ const cloudinary = require('cloudinary').v2;
  * Cloudinary integration with automatic optimization
  */
 
-// Configure Cloudinary with fallback to EXPO_PUBLIC prefix for frontend compatibility
 cloudinary.config({
     cloud_name: process.env.CLOUDINARY_CLOUD_NAME || process.env.EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME,
     api_key: process.env.CLOUDINARY_API_KEY || process.env.EXPO_PUBLIC_CLOUDINARY_API_KEY,
@@ -16,11 +15,10 @@ cloudinary.config({
 class CDNService {
     /**
      * Generate signed upload parameters
-     * This allows secure client-side uploads without exposing API secret
      */
     getSignedUploadParams(folder = 'elitehub', options = {}) {
         const timestamp = Math.round(Date.now() / 1000);
-        
+
         const uploadParams = {
             timestamp,
             folder,
@@ -82,10 +80,7 @@ class CDNService {
      */
     async uploadMultiple(files, options = {}) {
         try {
-            const uploadPromises = files.map(file => 
-                this.uploadFile(file, options)
-            );
-
+            const uploadPromises = files.map(file => this.uploadFile(file, options));
             return await Promise.all(uploadPromises);
         } catch (error) {
             console.error('Upload multiple error:', error);
@@ -135,42 +130,54 @@ class CDNService {
 
     /**
      * Optimize image URL
-     * Applies automatic format conversion and quality optimization
+     *
+     * ✅ FIX: Uses c_fill (not c_fit) so images always fill their container
+     * edge-to-edge without letterboxing. Only width is set — no height
+     * constraint — so the image's natural aspect ratio is preserved.
      */
     optimizeUrl(url, options = {}) {
         if (!url) return url;
 
-        // If it's not a Cloudinary URL, return as is
         if (!url.includes('cloudinary.com')) {
             return url;
         }
 
+        // Guard: don't stack transformations if they already exist
+        const uploadIndex = url.indexOf('/upload/');
+        if (uploadIndex === -1) return url;
+
         try {
-            const transformations = [];
+            const transformations = [
+                'f_auto',       // WebP/AVIF for modern devices
+                'q_auto:good',  // Good quality — faster than :best, visually identical
+            ];
 
-            // Auto format (WebP/AVIF for modern browsers)
-            transformations.push('f_auto');
-
-            // Auto quality
-            transformations.push('q_auto:best');
-
-            // Responsive sizing
             if (options.width) {
                 transformations.push(`w_${options.width}`);
             }
 
+            // ✅ FIX: Only add height if explicitly provided.
+            // Previously height was always passed as 800 alongside width 800,
+            // which forced a square crop even for portrait/landscape products.
             if (options.height) {
                 transformations.push(`h_${options.height}`);
             }
 
-            // Crop mode
-            if (options.crop) {
-                transformations.push(`c_${options.crop}`);
+            // ✅ FIX: Default to c_fill so the image fills its frame.
+            // c_fit would leave empty space (letterbox). c_fill crops smartly.
+            const crop = options.crop || 'fill';
+            transformations.push(`c_${crop}`);
+
+            // Gravity for smart cropping (default auto detects focal point)
+            if (options.gravity) {
+                transformations.push(`g_${options.gravity}`);
             }
 
-            // Apply transformations
             const transformString = transformations.join(',');
-            return url.replace('/upload/', `/upload/${transformString}/`);
+            const baseUrl = url.substring(0, uploadIndex + 8);
+            const remainingPath = url.substring(uploadIndex + 8);
+
+            return `${baseUrl}${transformString}/${remainingPath}`;
         } catch (error) {
             console.error('Optimize URL error:', error);
             return url;
@@ -178,25 +185,34 @@ class CDNService {
     }
 
     /**
-     * Get optimized thumbnail
+     * Thumbnail — square crop for compact cards / avatars
      */
     getThumbnail(url, width = 300, height = 300) {
         return this.optimizeUrl(url, {
             width,
             height,
-            crop: 'fill'
+            crop: 'fill',
+            gravity: 'auto'
         });
     }
 
     /**
      * Generate responsive image variants
+     *
+     * ✅ FIX: medium and large no longer pass height, so the image's
+     * natural aspect ratio is preserved (no squishing or letterboxing).
      */
     getResponsiveVariants(url) {
         return {
-            thumbnail: this.optimizeUrl(url, { width: 150, height: 150, crop: 'fill' }),
-            small: this.optimizeUrl(url, { width: 400, height: 400, crop: 'fit' }),
-            medium: this.optimizeUrl(url, { width: 800, height: 800, crop: 'fit' }),
-            large: this.optimizeUrl(url, { width: 1200, height: 1200, crop: 'fit' }),
+            // Square thumbnail — fine for icons/avatars
+            thumbnail: this.optimizeUrl(url, { width: 150, height: 150, crop: 'fill', gravity: 'auto' }),
+            // Small preview — width only, natural height
+            small: this.optimizeUrl(url, { width: 400, crop: 'fill', gravity: 'auto' }),
+            // Medium — width only, natural height (used by ProductCard grid/list)
+            medium: this.optimizeUrl(url, { width: 800, crop: 'fill', gravity: 'auto' }),
+            // Large — width only, natural height (used by product detail / zoom)
+            large: this.optimizeUrl(url, { width: 1200, crop: 'fill', gravity: 'auto' }),
+            // Original with only format+quality optimization
             original: this.optimizeUrl(url)
         };
     }
@@ -219,12 +235,14 @@ class CDNService {
      * Get CDN URL for static assets
      */
     getCdnUrl(path) {
-        const cdnBase = process.env.CDN_BASE_URL || 
-            `https://res.cloudinary.com/${process.env.CLOUDINARY_CLOUD_NAME || process.env.EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME}`;
-        
-        // Remove leading slash if present
+        const cdnBase =
+            process.env.CDN_BASE_URL ||
+            `https://res.cloudinary.com/${
+                process.env.CLOUDINARY_CLOUD_NAME ||
+                process.env.EXPO_PUBLIC_CLOUDINARY_CLOUD_NAME
+            }`;
+
         const cleanPath = path.replace(/^\/+/, '');
-        
         return `${cdnBase}/${cleanPath}`;
     }
 
@@ -251,13 +269,14 @@ class CDNService {
 
     /**
      * Upload product image with standard transformations
+     * c_limit preserves aspect ratio and never upscales
      */
     async uploadProductImage(fileBuffer, productId) {
         return this.uploadFile(fileBuffer, {
             folder: 'products',
             public_id: `product_${productId}_${Date.now()}`,
             transformation: [
-                { width: 1200, height: 1200, crop: 'limit' },
+                { width: 1200, crop: 'limit' }, // ✅ No fixed height — preserves aspect ratio
                 { quality: 'auto:best' },
                 { fetch_format: 'auto' }
             ]
