@@ -17,10 +17,10 @@ const CACHE_KEYS = {
 };
 
 const CACHE_TTL = {
-    PROVIDER_LIST: 300, // 5 minutes
+    PROVIDER_LIST: 300,   // 5 minutes
     PROVIDER_PROFILE: 600, // 10 minutes
-    REVIEWS: 180, // 3 minutes
-    SUBSCRIPTION: 60, // 1 minute
+    REVIEWS: 180,          // 3 minutes
+    SUBSCRIPTION: 60,      // 1 minute
 };
 
 class ServiceProviderService {
@@ -31,20 +31,17 @@ class ServiceProviderService {
         const cacheKey = CACHE_KEYS.PROVIDER_LIST(category, filters);
 
         try {
-            // Try cache first
             const cached = await client.get(cacheKey);
             if (cached) {
                 console.log('🚀 Cache HIT: providers list');
                 return JSON.parse(cached);
             }
 
-            // Build query
             let query = db.collection('users')
                 .where('role', '==', 'service')
                 .where('serviceCategory', '==', category)
                 .where('hasCompletedBusinessProfile', '==', true);
 
-            // Apply filters
             if (filters.state) {
                 query = query.where('location.state', '==', filters.state);
             }
@@ -58,17 +55,13 @@ class ServiceProviderService {
             let providers = snapshot.docs
                 .map(doc => ({ uid: doc.id, ...doc.data() }))
                 .filter(p => {
-                    // Filter by subscription status
                     const isSubscribed = (p.subscriptionExpiresAt || 0) > now;
                     const isSelf = filters.currentUserId === p.uid;
-                    
                     return isSubscribed || isSelf;
                 });
 
-            // Sort by favorites and reviews
             providers = this._sortProviders(providers, filters.userFavorites || []);
 
-            // Cache for 5 minutes
             await client.setEx(cacheKey, CACHE_TTL.PROVIDER_LIST, JSON.stringify(providers));
 
             return providers;
@@ -85,35 +78,30 @@ class ServiceProviderService {
         const cacheKey = CACHE_KEYS.PROVIDER_PROFILE(providerId);
 
         try {
-            // Try cache first
             const cached = await client.get(cacheKey);
             if (cached) {
                 const profile = JSON.parse(cached);
-                
-                // Track view if viewer is provided
+
                 if (viewerId && viewerId !== providerId) {
                     this._trackProfileView(providerId, viewerId);
                 }
-                
+
                 return profile;
             }
 
-            // Fetch from database
             const providerDoc = await db.collection('users').doc(providerId).get();
-            
-            if (!providerDoc.exists()) {
+
+            // ✅ FIX: .exists is a property in Admin SDK, not a method
+            if (!providerDoc.exists) {
                 throw new Error('Provider not found');
             }
 
             const profile = { uid: providerDoc.id, ...providerDoc.data() };
 
-            // Remove sensitive data
             delete profile.paystackRecipientCode;
 
-            // Cache for 10 minutes
             await client.setEx(cacheKey, CACHE_TTL.PROVIDER_PROFILE, JSON.stringify(profile));
 
-            // Track view
             if (viewerId && viewerId !== providerId) {
                 await this._trackProfileView(providerId, viewerId);
             }
@@ -155,13 +143,11 @@ class ServiceProviderService {
         const lockKey = `subscription:lock:${providerId}`;
 
         try {
-            // Check if already processing
             const isLocked = await client.get(lockKey);
             if (isLocked) {
                 throw new Error('Subscription already processing');
             }
 
-            // Set lock
             await client.setEx(lockKey, 60, 'processing');
 
             const selectedPlan = SUBSCRIPTION_PLANS[plan];
@@ -179,26 +165,24 @@ class ServiceProviderService {
                     transaction.get(walletRef)
                 ]);
 
-                if (!providerSnap.exists()) {
+                // ✅ FIX: .exists is a property in Admin SDK, not a method
+                if (!providerSnap.exists) {
                     throw new Error('Provider not found');
                 }
 
                 const provider = providerSnap.data();
-                const wallet = walletSnap.data();
+                const wallet = walletSnap.exists ? walletSnap.data() : { balance: 0 };
 
-                // Check profile completion
                 if ((provider.profileCompletionPercentage || 0) < 70) {
                     throw new Error('Profile must be at least 70% complete');
                 }
 
-                // Check wallet balance
-                if ((wallet?.balance || 0) < selectedPlan.price) {
+                if ((wallet.balance || 0) < selectedPlan.price) {
                     throw new Error('Insufficient wallet balance');
                 }
 
                 const expiresAt = Date.now() + (selectedPlan.duration * 24 * 60 * 60 * 1000);
 
-                // Update provider
                 transaction.update(providerRef, {
                     subscriptionExpiresAt: expiresAt,
                     subscriptionType: plan.toLowerCase(),
@@ -207,13 +191,11 @@ class ServiceProviderService {
                     updatedAt: Date.now()
                 });
 
-                // Debit wallet
                 transaction.update(walletRef, {
                     balance: admin.firestore.FieldValue.increment(-selectedPlan.price),
                     updatedAt: admin.firestore.FieldValue.serverTimestamp()
                 });
 
-                // Create transaction
                 transaction.set(txnRef, {
                     id: txnRef.id,
                     userId: providerId,
@@ -231,13 +213,9 @@ class ServiceProviderService {
                 });
             });
 
-            // Clear caches
             await this._invalidateProviderCache(providerId);
-
-            // Release lock
             await client.del(lockKey);
 
-            // Send notification
             await pushNotificationService.sendPushToUser(
                 providerId,
                 "✅ Subscription Active!",
@@ -269,8 +247,9 @@ class ServiceProviderService {
             }
 
             const providerDoc = await db.collection('users').doc(providerId).get();
-            
-            if (!providerDoc.exists()) {
+
+            // ✅ FIX: .exists is a property in Admin SDK, not a method
+            if (!providerDoc.exists) {
                 throw new Error('Provider not found');
             }
 
@@ -303,9 +282,7 @@ class ServiceProviderService {
     async checkExpiryReminders() {
         try {
             const threeDaysFromNow = Date.now() + (3 * 24 * 60 * 60 * 1000);
-            const oneDayFromNow = Date.now() + (24 * 60 * 60 * 1000);
 
-            // Get expiring subscriptions
             const expiringSnapshot = await db.collection('users')
                 .where('role', '==', 'service')
                 .where('subscriptionExpiresAt', '<=', threeDaysFromNow)
@@ -348,7 +325,7 @@ class ServiceProviderService {
 
             for (const doc of unsubscribedSnapshot.docs) {
                 const lastNotified = await client.get(`reminder:sent:${doc.id}`);
-                
+
                 if (!lastNotified) {
                     await pushNotificationService.sendPushToUser(
                         doc.id,
@@ -357,7 +334,6 @@ class ServiceProviderService {
                         { screen: "ServiceProviderDashboard" }
                     );
 
-                    // Don't spam - remind once per week
                     await client.setEx(`reminder:sent:${doc.id}`, 604800, 'true');
                 }
             }
@@ -379,14 +355,12 @@ class ServiceProviderService {
             const hasViewed = await client.get(viewKey);
             if (hasViewed) return;
 
-            // Increment view count
             await db.collection('users').doc(providerId).update({
                 [`viewStats.${currentMonth}`]: admin.firestore.FieldValue.increment(1),
                 totalViews: admin.firestore.FieldValue.increment(1),
                 updatedAt: Date.now()
             });
 
-            // Cache for rest of month
             const daysInMonth = new Date(
                 new Date().getFullYear(),
                 new Date().getMonth() + 1,
@@ -397,7 +371,6 @@ class ServiceProviderService {
 
             await client.setEx(viewKey, ttl, 'true');
 
-            // Send notification
             await pushNotificationService.sendPushToUser(
                 providerId,
                 "👀 Profile View",
@@ -414,18 +387,15 @@ class ServiceProviderService {
      */
     _sortProviders(providers, userFavorites = []) {
         return providers.sort((a, b) => {
-            // Favorites first
             const aIsFav = userFavorites.includes(a.uid);
             const bIsFav = userFavorites.includes(b.uid);
             if (aIsFav && !bIsFav) return -1;
             if (!aIsFav && bIsFav) return 1;
 
-            // Then by total reviews
             const aReviews = a.totalReviewsAllTime || 0;
             const bReviews = b.totalReviewsAllTime || 0;
             if (aReviews !== bReviews) return bReviews - aReviews;
 
-            // Then by rating
             const aRating = a.rating || 0;
             const bRating = b.rating || 0;
             return bRating - aRating;
