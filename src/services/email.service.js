@@ -367,6 +367,65 @@ class EmailService {
     );
   }
 
+  // ─────────────────────────────────────────────────────────────
+  // OTP EMAILS
+  // ─────────────────────────────────────────────────────────────
+
+  /**
+   * ✅ Signup email verification OTP
+   * Called by: POST /api/v1/otp/send-verification
+   */
+  async sendSignupVerificationOTP(toEmail, otp) {
+    const content = `
+      <h2 style="color:#667eea; text-align:center;">Verify Your Email 📧</h2>
+      <p>Hi there,</p>
+      <p>Enter this code to verify your email address and complete your EliteHub signup:</p>
+      <div style="text-align:center; margin: 30px 0;">
+        <div style="display:inline-block; background:#f0f0ff; border: 2px dashed #667eea; border-radius:12px; padding: 20px 40px;">
+          <span style="font-size:42px; font-weight:900; letter-spacing:12px; color:#667eea;">${otp}</span>
+        </div>
+      </div>
+      <div class="info-box">
+        <p style="margin:0; font-size:13px;">⏱️ This code expires in <strong>10 minutes</strong>.<br>
+        🔒 Never share this code with anyone — EliteHub will never ask for it.</p>
+      </div>
+      <p style="font-size:13px; color:#888; margin-top:20px;">If you did not try to sign up, you can safely ignore this email.</p>
+    `;
+    return this.sendEmail(
+      toEmail,
+      `${otp} — Your EliteHub Verification Code`,
+      getBaseTemplate(content, '#667eea')
+    );
+  }
+
+  /**
+   * ✅ Password reset OTP
+   * Called by: POST /api/v1/otp/send-password-reset
+   */
+  async sendPasswordResetOTP(toEmail, name, otp) {
+    const firstName = name?.split(' ')[0] || 'there';
+    const content = `
+      <h2 style="color:#ef4444; text-align:center;">Password Reset Code 🔐</h2>
+      <p>Hi ${firstName},</p>
+      <p>We received a request to reset your EliteHub password. Use the code below:</p>
+      <div style="text-align:center; margin: 30px 0;">
+        <div style="display:inline-block; background:#fff5f5; border: 2px dashed #ef4444; border-radius:12px; padding: 20px 40px;">
+          <span style="font-size:42px; font-weight:900; letter-spacing:12px; color:#ef4444;">${otp}</span>
+        </div>
+      </div>
+      <div class="info-box">
+        <p style="margin:0; font-size:13px;">⏱️ This code expires in <strong>10 minutes</strong>.<br>
+        🔒 Never share this code with anyone — EliteHub will never ask for it.</p>
+      </div>
+      <p style="font-size:13px; color:#888; margin-top:20px;">If you did not request a password reset, your account is safe — no action needed.</p>
+    `;
+    return this.sendEmail(
+      toEmail,
+      `${otp} — Your EliteHub Password Reset Code`,
+      getBaseTemplate(content, '#ef4444')
+    );
+  }
+
   async sendDeliveryConfirmation(toEmail, name, orderId, amount) {
     const firstName = name?.split(' ')[0] || 'there';
     const shortId = orderId.slice(-8).toUpperCase();
