@@ -17,7 +17,7 @@ const CACHE_KEYS = {
 };
 
 const CACHE_TTL = {
-    PROVIDER_LIST: 300,   // 5 minutes
+    PROVIDER_LIST: 300,    // 5 minutes
     PROVIDER_PROFILE: 600, // 10 minutes
     REVIEWS: 180,          // 3 minutes
     SUBSCRIPTION: 60,      // 1 minute
@@ -25,10 +25,32 @@ const CACHE_TTL = {
 
 class ServiceProviderService {
     /**
-     * ✅ Get providers by category with caching
+     * ✅ Get providers by category with pagination, server-side search, and caching
+     *
+     * Supported filters:
+     *   state, city, area      — location filters
+     *   subcategory            — subcategory filter
+     *   q                      — full-text search across businessName & serviceDescription
+     *   page  (default: 1)     — page number (1-indexed)
+     *   limit (default: 20)    — page size (max: 50)
+     *   currentUserId          — used to always surface the provider's own profile
+     *   userFavorites          — array of uids to pin at the top
      */
     async getProvidersByCategory(category, filters = {}) {
-        const cacheKey = CACHE_KEYS.PROVIDER_LIST(category, filters);
+        const page  = Math.max(1, parseInt(filters.page)  || 1);
+        const limit = Math.min(50, Math.max(1, parseInt(filters.limit) || 20));
+        const offset = (page - 1) * limit;
+
+        // ── Cache key includes all pagination/search params ──────────────────
+        const cacheKey = CACHE_KEYS.PROVIDER_LIST(category, {
+            state: filters.state || null,
+            city: filters.city || null,
+            area: filters.area || null,
+            subcategory: filters.subcategory || null,
+            q: filters.q || null,
+            page,
+            limit,
+        });
 
         try {
             const cached = await client.get(cacheKey);
@@ -37,6 +59,7 @@ class ServiceProviderService {
                 return JSON.parse(cached);
             }
 
+            // ── Build Firestore query (indexed filters only) ──────────────────
             let query = db.collection('users')
                 .where('role', '==', 'service')
                 .where('serviceCategory', '==', category)
@@ -48,10 +71,17 @@ class ServiceProviderService {
             if (filters.city) {
                 query = query.where('location.city', '==', filters.city);
             }
+            if (filters.area) {
+                query = query.where('location.area', '==', filters.area);
+            }
+            if (filters.subcategory) {
+                query = query.where('serviceSubcategory', '==', filters.subcategory);
+            }
 
             const snapshot = await query.get();
             const now = Date.now();
 
+            // ── Map, filter expired subscriptions, apply search ───────────────
             let providers = snapshot.docs
                 .map(doc => ({ uid: doc.id, ...doc.data() }))
                 .filter(p => {
@@ -60,11 +90,34 @@ class ServiceProviderService {
                     return isSubscribed || isSelf;
                 });
 
+            // ── Server-side search across name + description ──────────────────
+            if (filters.q && filters.q.trim()) {
+                const q = filters.q.trim().toLowerCase();
+                providers = providers.filter(p =>
+                    (p.businessName || '').toLowerCase().includes(q) ||
+                    (p.serviceDescription || '').toLowerCase().includes(q)
+                );
+            }
+
+            // ── Sort (favorites first, then by reviews + rating) ─────────────
             providers = this._sortProviders(providers, filters.userFavorites || []);
 
-            await client.setEx(cacheKey, CACHE_TTL.PROVIDER_LIST, JSON.stringify(providers));
+            // ── Paginate ─────────────────────────────────────────────────────
+            const totalCount = providers.length;
+            const paginated  = providers.slice(offset, offset + limit);
+            const hasMore    = offset + paginated.length < totalCount;
 
-            return providers;
+            const result = {
+                providers: paginated,
+                hasMore,
+                totalCount,
+                page,
+                limit,
+            };
+
+            await client.setEx(cacheKey, CACHE_TTL.PROVIDER_LIST, JSON.stringify(result));
+
+            return result;
         } catch (error) {
             console.error('Get providers error:', error);
             throw error;
@@ -81,23 +134,19 @@ class ServiceProviderService {
             const cached = await client.get(cacheKey);
             if (cached) {
                 const profile = JSON.parse(cached);
-
                 if (viewerId && viewerId !== providerId) {
                     this._trackProfileView(providerId, viewerId);
                 }
-
                 return profile;
             }
 
             const providerDoc = await db.collection('users').doc(providerId).get();
 
-            // ✅ FIX: .exists is a property in Admin SDK, not a method
             if (!providerDoc.exists) {
                 throw new Error('Provider not found');
             }
 
             const profile = { uid: providerDoc.id, ...providerDoc.data() };
-
             delete profile.paystackRecipientCode;
 
             await client.setEx(cacheKey, CACHE_TTL.PROVIDER_PROFILE, JSON.stringify(profile));
@@ -126,7 +175,6 @@ class ServiceProviderService {
             }
 
             const reviews = await reviewService.getProviderReviews(providerId, false);
-
             await client.setEx(cacheKey, CACHE_TTL.REVIEWS, JSON.stringify(reviews));
 
             return reviews;
@@ -156,8 +204,8 @@ class ServiceProviderService {
             }
 
             const providerRef = db.collection('users').doc(providerId);
-            const walletRef = db.collection('wallets').doc(providerId);
-            const txnRef = db.collection('transactions').doc(`sub_${Date.now()}_${providerId.slice(0, 4)}`);
+            const walletRef   = db.collection('wallets').doc(providerId);
+            const txnRef      = db.collection('transactions').doc(`sub_${Date.now()}_${providerId.slice(0, 4)}`);
 
             await db.runTransaction(async (transaction) => {
                 const [providerSnap, walletSnap] = await Promise.all([
@@ -165,13 +213,12 @@ class ServiceProviderService {
                     transaction.get(walletRef)
                 ]);
 
-                // ✅ FIX: .exists is a property in Admin SDK, not a method
                 if (!providerSnap.exists) {
                     throw new Error('Provider not found');
                 }
 
                 const provider = providerSnap.data();
-                const wallet = walletSnap.exists ? walletSnap.data() : { balance: 0 };
+                const wallet   = walletSnap.exists ? walletSnap.data() : { balance: 0 };
 
                 if ((provider.profileCompletionPercentage || 0) < 70) {
                     throw new Error('Profile must be at least 70% complete');
@@ -205,11 +252,7 @@ class ServiceProviderService {
                     description: `Service Provider ${selectedPlan.label}`,
                     timestamp: Date.now(),
                     status: 'completed',
-                    metadata: {
-                        plan,
-                        expiresAt,
-                        reference: txnRef.id
-                    }
+                    metadata: { plan, expiresAt, reference: txnRef.id }
                 });
             });
 
@@ -248,14 +291,13 @@ class ServiceProviderService {
 
             const providerDoc = await db.collection('users').doc(providerId).get();
 
-            // ✅ FIX: .exists is a property in Admin SDK, not a method
             if (!providerDoc.exists) {
                 throw new Error('Provider not found');
             }
 
-            const provider = providerDoc.data();
-            const expiresAt = provider.subscriptionExpiresAt || 0;
-            const now = Date.now();
+            const provider    = providerDoc.data();
+            const expiresAt   = provider.subscriptionExpiresAt || 0;
+            const now         = Date.now();
             const isSubscribed = expiresAt > now;
 
             const status = {
@@ -314,7 +356,7 @@ class ServiceProviderService {
      */
     async sendUnsubscribedReminders() {
         try {
-            const now = Date.now();
+            const now         = Date.now();
             const sevenDaysAgo = now - (7 * 24 * 60 * 60 * 1000);
 
             const unsubscribedSnapshot = await db.collection('users')
@@ -333,7 +375,6 @@ class ServiceProviderService {
                         "Subscribe now to start receiving client requests again!",
                         { screen: "ServiceProviderDashboard" }
                     );
-
                     await client.setEx(`reminder:sent:${doc.id}`, 604800, 'true');
                 }
             }
@@ -345,7 +386,7 @@ class ServiceProviderService {
     }
 
     /**
-     * ✅ Track profile view
+     * ✅ Track profile view (once per viewer per month)
      */
     async _trackProfileView(providerId, viewerId) {
         try {
@@ -367,9 +408,7 @@ class ServiceProviderService {
                 0
             ).getDate();
             const daysLeft = daysInMonth - new Date().getDate();
-            const ttl = daysLeft * 24 * 60 * 60;
-
-            await client.setEx(viewKey, ttl, 'true');
+            await client.setEx(viewKey, daysLeft * 24 * 60 * 60, 'true');
 
             await pushNotificationService.sendPushToUser(
                 providerId,
@@ -383,7 +422,7 @@ class ServiceProviderService {
     }
 
     /**
-     * ✅ Sort providers
+     * ✅ Sort providers: favorites first, then by review count, then by rating
      */
     _sortProviders(providers, userFavorites = []) {
         return providers.sort((a, b) => {
@@ -396,14 +435,12 @@ class ServiceProviderService {
             const bReviews = b.totalReviewsAllTime || 0;
             if (aReviews !== bReviews) return bReviews - aReviews;
 
-            const aRating = a.rating || 0;
-            const bRating = b.rating || 0;
-            return bRating - aRating;
+            return (b.rating || 0) - (a.rating || 0);
         });
     }
 
     /**
-     * ✅ Invalidate all provider caches
+     * ✅ Invalidate all provider-specific caches
      */
     async _invalidateProviderCache(providerId) {
         await Promise.all([

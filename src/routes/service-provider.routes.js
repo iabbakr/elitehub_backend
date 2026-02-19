@@ -1,4 +1,4 @@
-// routes/service-provider.routes.js - BACKEND ROUTES (CLEAN)
+// routes/service-provider.routes.js - PRODUCTION-GRADE BACKEND ROUTES
 const express = require('express');
 const router = express.Router();
 const { authenticate, userRateLimit } = require('../middleware/auth');
@@ -10,26 +10,73 @@ const AppError = require('../utils/AppError');
 
 /**
  * GET /api/v1/service-providers/category/:category
- * Get providers by category with caching
+ *
+ * Query params:
+ *   state        — filter by state
+ *   city         — filter by city
+ *   area         — filter by area
+ *   subcategory  — filter by service subcategory
+ *   q            — search term (matches businessName & serviceDescription)
+ *   page         — page number, default 1
+ *   limit        — page size, default 20, max 50
+ *   userId       — current viewer's uid (surfaces own profile even if unsubscribed)
+ *
+ * Response:
+ *   { success, providers, hasMore, totalCount, page, limit, count }
  */
 router.get(
     '/category/:category',
-    cacheMiddleware(300), // 5 minutes
     catchAsync(async (req, res) => {
         const { category } = req.params;
-        const { state, city, area, userId } = req.query;
-
-        const providers = await serviceProviderService.getProvidersByCategory(category, {
+        const {
             state,
             city,
             area,
-            currentUserId: userId
+            subcategory,
+            q,
+            page  = 1,
+            limit = 20,
+            userId,
+        } = req.query;
+
+        const result = await serviceProviderService.getProvidersByCategory(category, {
+            state,
+            city,
+            area,
+            subcategory,
+            q,
+            page,
+            limit,
+            currentUserId: userId,
         });
 
         res.json({
             success: true,
-            providers,
-            count: providers.length
+            providers:  result.providers,
+            hasMore:    result.hasMore,
+            totalCount: result.totalCount,
+            page:       result.page,
+            limit:      result.limit,
+            count:      result.providers.length,
+        });
+    })
+);
+
+/**
+ * GET /api/v1/service-providers/subscription/status
+ * Must be defined BEFORE /:providerId to avoid route collision
+ */
+router.get(
+    '/subscription/status',
+    authenticate,
+    catchAsync(async (req, res) => {
+        const providerId = req.userId;
+
+        const status = await serviceProviderService.getSubscriptionStatus(providerId);
+
+        res.json({
+            success: true,
+            subscription: status
         });
     })
 );
@@ -84,20 +131,17 @@ router.post(
     catchAsync(async (req, res, next) => {
         const { providerId } = req.params;
         const { rating, comment } = req.body;
-        const userId = req.userId;
+        const userId  = req.userId;
         const userName = req.userProfile?.name || 'Anonymous';
 
-        // ✅ CRITICAL: Prevent self-review
         if (userId === providerId) {
             return next(new AppError('You cannot review yourself', 400));
         }
 
-        // ✅ CRITICAL: Prevent service providers from reviewing
         if (req.userProfile?.role === 'service') {
             return next(new AppError('Service providers cannot submit reviews', 403));
         }
 
-        // Validation
         if (!rating || rating < 1 || rating > 5) {
             return next(new AppError('Rating must be between 1 and 5', 400));
         }
@@ -106,7 +150,6 @@ router.post(
             return next(new AppError('Comment must be at least 10 characters', 400));
         }
 
-        // Submit review
         const result = await reviewService.submitReview(
             providerId,
             userId,
@@ -115,7 +158,6 @@ router.post(
             comment
         );
 
-        // Send notification to provider
         const pushNotificationService = require('../services/push-notification.service');
         await pushNotificationService.sendPushToUser(
             providerId,
@@ -134,7 +176,7 @@ router.post(
 
 /**
  * POST /api/v1/service-providers/subscribe
- * Subscribe to service
+ * Subscribe provider (deducts from wallet)
  */
 router.post(
     '/subscribe',
@@ -144,7 +186,6 @@ router.post(
         const { plan } = req.body;
         const providerId = req.userId;
 
-        // Validate user is a service provider
         if (req.userProfile?.role !== 'service') {
             return next(new AppError('Only service providers can subscribe', 403));
         }
@@ -156,27 +197,8 @@ router.post(
 );
 
 /**
- * GET /api/v1/service-providers/subscription/status
- * Get subscription status
- */
-router.get(
-    '/subscription/status',
-    authenticate,
-    catchAsync(async (req, res) => {
-        const providerId = req.userId;
-
-        const status = await serviceProviderService.getSubscriptionStatus(providerId);
-
-        res.json({
-            success: true,
-            subscription: status
-        });
-    })
-);
-
-/**
  * POST /api/v1/service-providers/track-view/:providerId
- * Track profile view
+ * Track profile view (authenticated, non-self only)
  */
 router.post(
     '/track-view/:providerId',
@@ -185,7 +207,6 @@ router.post(
         const { providerId } = req.params;
         const userId = req.userId;
 
-        // Don't track self-views
         if (userId === providerId) {
             return res.json({ success: true, tracked: false });
         }
@@ -201,7 +222,7 @@ router.post(
 
 /**
  * POST /api/v1/service-providers/share/:providerId
- * Generate share link
+ * Generate platform-specific share link
  */
 router.post(
     '/share/:providerId',
@@ -212,7 +233,7 @@ router.post(
         const provider = await serviceProviderService.getProviderProfile(providerId);
 
         const shareUrl = `https://elitehubng.com/service-provider/${providerId}`;
-        const message = `Check out ${provider.businessName} on EliteHub! ${provider.serviceDescription || ''}`;
+        const message  = `Check out ${provider.businessName} on EliteHub! ${provider.serviceDescription || ''}`;
 
         let platformUrl;
         switch (platform) {
