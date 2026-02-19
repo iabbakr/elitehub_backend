@@ -190,9 +190,19 @@ router.post(
             return next(new AppError('Only service providers can subscribe', 403));
         }
 
-        const result = await serviceProviderService.subscribe(providerId, plan);
-
-        res.json(result);
+        try {
+            const result = await serviceProviderService.subscribe(providerId, plan);
+            res.json(result);
+        } catch (error) {
+            // Check if it's a balance issue and return 400 instead of 500
+            if (error.message === 'Insufficient wallet balance') {
+                return next(new AppError('Your wallet balance is too low for this plan.', 400));
+            }
+            if (error.message === 'Profile must be at least 70% complete') {
+                return next(new AppError(error.message, 400));
+            }
+            next(error); // Pass through other actual 500 errors
+        }
     })
 );
 
