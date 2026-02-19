@@ -1,30 +1,29 @@
+// services/email.service.js - PRODUCTION EMAIL SERVICE (Resend)
 const { Resend } = require('resend');
-
-/**
- * Initialize Resend with your API Key
- * API Key should be stored in your .env file
- */
-const resend = new Resend(process.env.RESEND_API_KEY);
-
 
 if (!process.env.RESEND_API_KEY) {
   console.error('❌ RESEND_API_KEY is missing in .env file');
   process.exit(1);
 }
 
-console.log('✅ Resend initialized with API key:', 
-  process.env.RESEND_API_KEY.substring(0, 10) + '...'
-);
-/**
- * The sender address. 
- * Note: Until your domain is verified in the Resend dashboard,
- * you can only send emails to your own registration address.
- */
-const FROM_EMAIL = 'EliteHub Nigeria <noreply@elitehubng.com>';
+const resend = new Resend(process.env.RESEND_API_KEY);
+
+console.log('✅ Resend initialized');
 
 /**
- * Base HTML Template for Consistent Branding
+ * FROM address — must match your verified Resend domain.
+ * Your domain: elitehubng.com → verified at https://resend.com/domains
  */
+/**
+ * ✅ CRITICAL: Must match your VERIFIED Resend domain.
+ * Your verified domain is: mail.elitehubng.com
+ * So FROM address must use @mail.elitehubng.com — NOT @elitehubng.com
+ */
+const FROM_EMAIL = 'EliteHub Nigeria <noreply@mail.elitehubng.com>';
+
+// ─────────────────────────────────────────────────────────────────
+// BASE HTML TEMPLATE
+// ─────────────────────────────────────────────────────────────────
 const getBaseTemplate = (content, brandColor = '#667eea') => `
 <!DOCTYPE html>
 <html>
@@ -39,9 +38,11 @@ const getBaseTemplate = (content, brandColor = '#667eea') => `
     .content { padding: 0 30px 30px; line-height: 1.6; color: #333; }
     .button { display: inline-block; padding: 14px 32px; background: ${brandColor}; color: #ffffff !important; text-decoration: none; border-radius: 8px; font-weight: 600; margin: 20px 0; }
     .amount { font-size: 32px; font-weight: bold; color: ${brandColor}; margin: 20px 0; text-align: center; }
+    .info-box { background: #f8f9ff; padding: 20px; border-radius: 10px; margin: 20px 0; border-left: 4px solid ${brandColor}; }
     .footer { background: #f9f9f9; padding: 20px; text-align: center; color: #888; font-size: 12px; }
     ul { padding-left: 20px; }
     li { margin-bottom: 8px; }
+    .divider { border: none; border-top: 1px solid #eee; margin: 20px 0; }
   </style>
 </head>
 <body>
@@ -54,19 +55,28 @@ const getBaseTemplate = (content, brandColor = '#667eea') => `
     </div>
     <div class="footer">
       <p>© ${new Date().getFullYear()} EliteHub Nigeria. All rights reserved.</p>
-      <p>Lagos, Nigeria | support@elitehubng.com</p>
+      <p>Lagos, Nigeria | <a href="mailto:support@elitehubng.com" style="color:#667eea;">support@elitehubng.com</a></p>
+      <p style="font-size:11px; color:#bbb;">You received this email because you signed up on EliteHub Nigeria.</p>
     </div>
   </div>
 </body>
 </html>
 `;
 
+// ─────────────────────────────────────────────────────────────────
+// EMAIL SERVICE CLASS
+// ─────────────────────────────────────────────────────────────────
 class EmailService {
+
   /**
-   * Core Email Sender
+   * ✅ Core sender — wraps Resend API
+   * Never throws — logs failure and returns null so a failed
+   * email never rolls back a successful database transaction.
    */
   async sendEmail(to, subject, html) {
     try {
+      console.log(`📧 Sending email → ${to} | Subject: ${subject}`);
+
       const { data, error } = await resend.emails.send({
         from: FROM_EMAIL,
         to: [to],
@@ -75,163 +85,306 @@ class EmailService {
       });
 
       if (error) {
-        throw new Error(error.message);
+        console.error(`❌ Resend API error for ${to}:`, error);
+        return null;
       }
 
-      console.log(`📧 Email sent to ${to}: ${subject}`);
+      console.log(`✅ Email delivered → ${to} | ID: ${data?.id}`);
       return data;
-    } catch (error) {
-      console.error(`❌ Email failed to ${to}:`, error.message || error);
-      // We catch errors here so that a failed email doesn't roll back 
-      // a successful database transaction (like a confirmed payment).
+    } catch (err) {
+      console.error(`❌ sendEmail exception for ${to}:`, err?.message || err);
       return null;
     }
   }
 
-  // ─────────────────────────────────────────────────────
-  // WALLET ALERTS
-  // ─────────────────────────────────────────────────────
-
-  async sendDepositAlert(toEmail, name, amount) {
-    const content = `
-      <h2 style="color: #28a745; text-align: center;">Deposit Confirmed ✅</h2>
-      <p>Hi ${name},</p>
-      <p>Your EliteHub wallet has been successfully credited and the funds are ready for use.</p>
-      <div class="amount">₦${amount.toLocaleString()}</div>
-      <p>You can now use this balance for airtime, data, bills, and shopping across our marketplace.</p>
-      <div style="text-align: center;">
-        <a href="https://app.elitehubng.com/wallet" class="button">View Wallet Balance</a>
-      </div>
-    `;
-    await this.sendEmail(toEmail, `Wallet Credited: ₦${amount.toLocaleString()} ✅`, getBaseTemplate(content, '#28a745'));
-  }
-
-  async sendWithdrawalConfirmation(toEmail, name, amount, bankDetails) {
-    const content = `
-      <h2 style="color: #dc3545; text-align: center;">Withdrawal Processed 💸</h2>
-      <p>Hi ${name},</p>
-      <p>Your withdrawal request has been successfully initiated.</p>
-      <div class="amount">₦${amount.toLocaleString()}</div>
-      <p><strong>Transfer Destination:</strong><br>
-      ${bankDetails.accountName}<br>
-      ${bankDetails.bankName} (${bankDetails.accountNumber})</p>
-      <p>Funds typically reflect in your bank account within 24 hours.</p>
-    `;
-    await this.sendEmail(toEmail, `Withdrawal: ₦${amount.toLocaleString()} Processed`, getBaseTemplate(content, '#dc3545'));
-  }
-
-  // ─────────────────────────────────────────────────────
-  // ORDER NOTIFICATIONS
-  // ─────────────────────────────────────────────────────
-
-  async sendOrderConfirmation(toEmail, name, orderId, orderDetails) {
-    const content = `
-      <h2 style="text-align: center;">Order Confirmed 🛍️</h2>
-      <p>Hi ${name},</p>
-      <p>Thank you! Your order has been placed successfully and the seller has been notified.</p>
-      <p><strong>Order ID:</strong> #${orderId.slice(-8).toUpperCase()}</p>
-      <div class="amount">₦${orderDetails.totalAmount.toLocaleString()}</div>
-      <p><strong>Delivery Address:</strong><br>${orderDetails.deliveryAddress}</p>
-      <div style="text-align: center;">
-        <a href="https://app.elitehubng.com/orders/${orderId}" class="button">Track Your Order</a>
-      </div>
-    `;
-    await this.sendEmail(toEmail, `Order Confirmed #${orderId.slice(-8).toUpperCase()}`, getBaseTemplate(content));
-  }
-
-  async sendNewOrderAlert(toEmail, sellerName, orderId, orderDetails) {
-    const content = `
-      <h2 style="color: #28a745; text-align: center;">New Order Received! 🔔</h2>
-      <p>Hi ${sellerName},</p>
-      <p>You have a new order waiting to be fulfilled.</p>
-      <p><strong>Order ID:</strong> #${orderId.slice(-8).toUpperCase()}</p>
-      <div class="amount">₦${orderDetails.sellerAmount.toLocaleString()}</div>
-      <p><strong>Items:</strong></p>
-      <ul>
-        ${orderDetails.products.map(p => `<li>${p.productName} × ${p.quantity}</li>`).join('')}
-      </ul>
-      <div style="text-align: center;">
-        <a href="https://app.elitehubng.com/orders/${orderId}" class="button">View & Fulfill Order</a>
-      </div>
-    `;
-    await this.sendEmail(toEmail, `New Order – ₦${orderDetails.sellerAmount.toLocaleString()}`, getBaseTemplate(content, '#28a745'));
-  }
-
-  async sendDeliveryConfirmation(toEmail, name, orderId, amount) {
-    const content = `
-      <h2 style="color: #28a745; text-align: center;">Order Delivered ✅</h2>
-      <p>Hi ${name},</p>
-      <p>Your order has been marked as delivered and the escrow funds have been released to the seller.</p>
-      <p><strong>Order ID:</strong> #${orderId.slice(-8).toUpperCase()}</p>
-      <div class="amount">₦${amount.toLocaleString()}</div>
-      <p>Thank you for shopping with EliteHub!</p>
-    `;
-    await this.sendEmail(toEmail, `Order Delivered #${orderId.slice(-8).toUpperCase()}`, getBaseTemplate(content, '#28a745'));
-  }
-
-  // ─────────────────────────────────────────────────────
-  // ONBOARDING
-  // ─────────────────────────────────────────────────────
+  // ─────────────────────────────────────────────────────────────
+  // ONBOARDING / WELCOME EMAILS
+  // ─────────────────────────────────────────────────────────────
 
   async sendBuyerWelcomeEmail(toEmail, name) {
     const firstName = name.split(' ')[0];
     const content = `
-      <h1 style="color: #667eea; text-align: center;">Welcome to EliteHub, ${firstName}! 🎉</h1>
-      <p>Your trusted marketplace for quality products and professional services in Nigeria is now at your fingertips.</p>
-      <div style="background: #f8f9ff; padding: 20px; border-radius: 10px; margin: 20px 0;">
-        <p><strong>What you can do now:</strong></p>
+      <h1 style="color:#667eea; text-align:center;">Welcome to EliteHub, ${firstName}! 🎉</h1>
+      <p>Hi ${firstName},</p>
+      <p>You're now part of Nigeria's fastest-growing marketplace. Here's what you can do right now:</p>
+      <div class="info-box">
         <ul>
-          <li>Browse thousands of verified products</li>
-          <li>Pay securely via Escrow</li>
-          <li>Pay utility bills & buy airtime/data</li>
-          <li>Track your deliveries in real-time</li>
+          <li>🛍️ Browse thousands of verified products</li>
+          <li>🔒 Pay securely via our Escrow system</li>
+          <li>📱 Buy airtime, data & pay utility bills</li>
+          <li>📦 Track your deliveries in real-time</li>
         </ul>
       </div>
-      <div style="text-align: center;">
-        <a href="https://app.elitehubng.com/explore" class="button">Start Shopping</a>
+      <div style="text-align:center;">
+        <a href="https://www.elitehubng.com" class="button">Start Shopping</a>
       </div>
+      <hr class="divider">
+      <p style="font-size:13px; color:#888;">Need help? Reply to this email or visit our support page.</p>
     `;
-    await this.sendEmail(toEmail, `Welcome to EliteHub Nigeria, ${firstName}! 🛍️`, getBaseTemplate(content, '#667eea'));
+    return this.sendEmail(
+      toEmail,
+      `Welcome to EliteHub Nigeria, ${firstName}! 🛍️`,
+      getBaseTemplate(content, '#667eea')
+    );
   }
 
   async sendSellerWelcomeEmail(toEmail, name) {
     const firstName = name.split(' ')[0];
     const content = `
-      <h1 style="color: #f97316; text-align: center;">Ready to Scale, ${firstName}? 🚀</h1>
-      <p>Welcome to the EliteHub seller community! You are now set to reach thousands of customers across the country.</p>
-      <div style="background: #fff7ed; padding: 20px; border-radius: 10px; margin: 20px 0;">
+      <h1 style="color:#f97316; text-align:center;">Ready to Scale, ${firstName}? 🚀</h1>
+      <p>Hi ${firstName},</p>
+      <p>Welcome to the EliteHub seller community! You can now reach thousands of customers across Nigeria.</p>
+      <div class="info-box">
         <p><strong>Your Seller Checklist:</strong></p>
         <ul>
-          <li>Add your first product to the marketplace</li>
-          <li>Complete your business profile</li>
-          <li>Link your verified bank account for payouts</li>
+          <li>✅ Complete your business profile</li>
+          <li>📦 Add your first product to the marketplace</li>
+          <li>🏦 Link your verified bank account for payouts</li>
+          <li>📢 Share your store link with your customers</li>
         </ul>
       </div>
-      <div style="text-align: center;">
-        <a href="https://app.elitehubng.com/seller/dashboard" class="button">Access Seller Dashboard</a>
+      <div style="text-align:center;">
+        <a href="https://www.elitehubng.com" class="button" style="background:#f97316;">Go to Seller Dashboard</a>
       </div>
+      <hr class="divider">
+      <p style="font-size:13px; color:#888;">Questions? Email us at <a href="mailto:support@elitehubng.com">support@elitehubng.com</a></p>
     `;
-    await this.sendEmail(toEmail, 'Welcome to EliteHub Marketplace! 💼', getBaseTemplate(content, '#f97316'));
+    return this.sendEmail(
+      toEmail,
+      'Welcome to EliteHub Marketplace! 💼',
+      getBaseTemplate(content, '#f97316')
+    );
   }
 
   async sendServiceWelcomeEmail(toEmail, name) {
     const firstName = name.split(' ')[0];
     const content = `
-      <h1 style="color: #10b981; text-align: center;">Welcome, ${firstName}! 🛠️</h1>
-      <p>Your pro account is active! Start connecting with clients who need your skills.</p>
-      <div style="background: #f0fdf4; padding: 20px; border-radius: 10px; margin: 20px 0;">
-        <p><strong>Boost your visibility:</strong></p>
+      <h1 style="color:#10b981; text-align:center;">Welcome, ${firstName}! 🛠️</h1>
+      <p>Hi ${firstName},</p>
+      <p>Your EliteHub Pro account is now active. Start connecting with clients who need your skills.</p>
+      <div class="info-box">
+        <p><strong>Boost your visibility fast:</strong></p>
         <ul>
-          <li>Complete your profile (aim for 70% or higher)</li>
-          <li>Upload your work portfolio and certifications</li>
-          <li>Respond quickly to new service inquiries</li>
+          <li>📝 Complete your profile (aim for 70%+)</li>
+          <li>🖼️ Upload work portfolio & certifications</li>
+          <li>⚡ Subscribe to appear in search results</li>
+          <li>💬 Respond quickly to new inquiries</li>
         </ul>
       </div>
-      <div style="text-align: center;">
-        <a href="https://app.elitehubng.com/service/profile" class="button">Complete My Profile</a>
+      <div style="text-align:center;">
+        <a href="https://www.elitehubng.com" class="button" style="background:#10b981;">Complete My Profile</a>
+      </div>
+      <hr class="divider">
+      <p style="font-size:13px; color:#888;">Need help getting started? Email <a href="mailto:support@elitehubng.com">support@elitehubng.com</a></p>
+    `;
+    return this.sendEmail(
+      toEmail,
+      'Pro Account Active – EliteHub Services 🎖️',
+      getBaseTemplate(content, '#10b981')
+    );
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // AUTH EMAILS (referenced in auth.routes.js)
+  // ─────────────────────────────────────────────────────────────
+
+  /**
+   * ✅ MISSING METHOD — Email verification link
+   * Called by: POST /api/v1/auth/verify-email
+   */
+  async sendVerificationEmail(toEmail, name, verificationLink) {
+    const firstName = name?.split(' ')[0] || 'there';
+    const content = `
+      <h2 style="color:#667eea; text-align:center;">Verify Your Email Address 📧</h2>
+      <p>Hi ${firstName},</p>
+      <p>Please verify your email address to unlock full access to your EliteHub account.</p>
+      <div style="text-align:center;">
+        <a href="${verificationLink}" class="button">Verify My Email</a>
+      </div>
+      <p style="font-size:13px; color:#888;">This link expires in 24 hours. If you didn't create an account, you can safely ignore this email.</p>
+      <div class="info-box">
+        <p style="margin:0; font-size:13px;">If the button doesn't work, copy and paste this link into your browser:<br>
+        <a href="${verificationLink}" style="color:#667eea; word-break:break-all;">${verificationLink}</a></p>
       </div>
     `;
-    await this.sendEmail(toEmail, 'Pro Account Active – EliteHub Services 🎖️', getBaseTemplate(content, '#10b981'));
+    return this.sendEmail(
+      toEmail,
+      'Verify Your EliteHub Email Address ✅',
+      getBaseTemplate(content, '#667eea')
+    );
+  }
+
+  /**
+   * ✅ MISSING METHOD — Password reset link
+   * Called by: POST /api/v1/auth/forgot-password
+   */
+  async sendPasswordResetEmail(toEmail, name, resetLink) {
+    const firstName = name?.split(' ')[0] || 'there';
+    const content = `
+      <h2 style="color:#ef4444; text-align:center;">Password Reset Request 🔐</h2>
+      <p>Hi ${firstName},</p>
+      <p>We received a request to reset your EliteHub password. Click the button below to create a new password.</p>
+      <div style="text-align:center;">
+        <a href="${resetLink}" class="button" style="background:#ef4444;">Reset My Password</a>
+      </div>
+      <p style="font-size:13px; color:#888;">⚠️ This link expires in <strong>1 hour</strong>. If you didn't request a password reset, no action is needed — your account is safe.</p>
+      <div class="info-box">
+        <p style="margin:0; font-size:13px;">If the button doesn't work, copy and paste this link:<br>
+        <a href="${resetLink}" style="color:#ef4444; word-break:break-all;">${resetLink}</a></p>
+      </div>
+    `;
+    return this.sendEmail(
+      toEmail,
+      'EliteHub Password Reset Request 🔐',
+      getBaseTemplate(content, '#ef4444')
+    );
+  }
+
+  /**
+   * ✅ MISSING METHOD — Password changed confirmation
+   * Called by: POST /api/v1/auth/change-password
+   */
+  async sendPasswordChangedEmail(toEmail, name) {
+    const firstName = name?.split(' ')[0] || 'there';
+    const now = new Date().toLocaleString('en-NG', {
+      timeZone: 'Africa/Lagos',
+      dateStyle: 'medium',
+      timeStyle: 'short',
+    });
+    const content = `
+      <h2 style="color:#10b981; text-align:center;">Password Changed Successfully ✅</h2>
+      <p>Hi ${firstName},</p>
+      <p>Your EliteHub account password was successfully changed on <strong>${now} (Lagos time)</strong>.</p>
+      <div class="info-box">
+        <p style="margin:0;">⚠️ <strong>If you did NOT make this change</strong>, please contact us immediately at 
+        <a href="mailto:support@elitehubng.com">support@elitehubng.com</a> and we will secure your account.</p>
+      </div>
+      <div style="text-align:center; margin-top:20px;">
+        <a href="https://www.elitehubng.com" class="button" style="background:#10b981;">Go to My Account</a>
+      </div>
+    `;
+    return this.sendEmail(
+      toEmail,
+      'Your EliteHub Password Has Been Changed ✅',
+      getBaseTemplate(content, '#10b981')
+    );
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // WALLET ALERTS
+  // ─────────────────────────────────────────────────────────────
+
+  async sendDepositAlert(toEmail, name, amount) {
+    const firstName = name?.split(' ')[0] || 'there';
+    const content = `
+      <h2 style="color:#28a745; text-align:center;">Wallet Credited ✅</h2>
+      <p>Hi ${firstName},</p>
+      <p>Your EliteHub wallet has been successfully topped up.</p>
+      <div class="amount">₦${Number(amount).toLocaleString()}</div>
+      <p>Your funds are ready to use for shopping, airtime, data, and bill payments.</p>
+      <div style="text-align:center;">
+        <a href="https://www.elitehubng.com" class="button" style="background:#28a745;">View Wallet</a>
+      </div>
+    `;
+    return this.sendEmail(
+      toEmail,
+      `Wallet Credited: ₦${Number(amount).toLocaleString()} ✅`,
+      getBaseTemplate(content, '#28a745')
+    );
+  }
+
+  async sendWithdrawalConfirmation(toEmail, name, amount, bankDetails) {
+    const firstName = name?.split(' ')[0] || 'there';
+    const content = `
+      <h2 style="color:#dc3545; text-align:center;">Withdrawal Processed 💸</h2>
+      <p>Hi ${firstName},</p>
+      <p>Your withdrawal has been successfully initiated.</p>
+      <div class="amount">₦${Number(amount).toLocaleString()}</div>
+      <div class="info-box">
+        <p style="margin:0;"><strong>Transfer to:</strong><br>
+        ${bankDetails.accountName}<br>
+        ${bankDetails.bankName} — ${bankDetails.accountNumber}</p>
+      </div>
+      <p style="font-size:13px; color:#888;">Funds typically arrive within 24 hours. If you have issues, contact support.</p>
+    `;
+    return this.sendEmail(
+      toEmail,
+      `Withdrawal of ₦${Number(amount).toLocaleString()} Processed`,
+      getBaseTemplate(content, '#dc3545')
+    );
+  }
+
+  // ─────────────────────────────────────────────────────────────
+  // ORDER NOTIFICATIONS
+  // ─────────────────────────────────────────────────────────────
+
+  async sendOrderConfirmation(toEmail, name, orderId, orderDetails) {
+    const firstName = name?.split(' ')[0] || 'there';
+    const shortId = orderId.slice(-8).toUpperCase();
+    const content = `
+      <h2 style="text-align:center;">Order Confirmed 🛍️</h2>
+      <p>Hi ${firstName},</p>
+      <p>Your order has been placed and the seller has been notified. Your funds are held safely in escrow.</p>
+      <div class="info-box">
+        <p><strong>Order ID:</strong> #${shortId}</p>
+        <p><strong>Total:</strong> ₦${Number(orderDetails.totalAmount).toLocaleString()}</p>
+        <p style="margin:0;"><strong>Delivery to:</strong> ${orderDetails.deliveryAddress}</p>
+      </div>
+      <div style="text-align:center;">
+        <a href="https://www.elitehubng.com" class="button">Track My Order</a>
+      </div>
+    `;
+    return this.sendEmail(
+      toEmail,
+      `Order Confirmed #${shortId} 🛍️`,
+      getBaseTemplate(content)
+    );
+  }
+
+  async sendNewOrderAlert(toEmail, sellerName, orderId, orderDetails) {
+    const firstName = sellerName?.split(' ')[0] || 'there';
+    const shortId = orderId.slice(-8).toUpperCase();
+    const content = `
+      <h2 style="color:#28a745; text-align:center;">New Order Received! 🔔</h2>
+      <p>Hi ${firstName},</p>
+      <p>You have a new order waiting to be fulfilled.</p>
+      <div class="info-box">
+        <p><strong>Order ID:</strong> #${shortId}</p>
+        <p><strong>Your Earnings:</strong> ₦${Number(orderDetails.sellerAmount).toLocaleString()}</p>
+        <p><strong>Items:</strong></p>
+        <ul>
+          ${orderDetails.products.map(p => `<li>${p.productName} × ${p.quantity}</li>`).join('')}
+        </ul>
+      </div>
+      <div style="text-align:center;">
+        <a href="https://www.elitehubng.com" class="button" style="background:#28a745;">View & Fulfil Order</a>
+      </div>
+    `;
+    return this.sendEmail(
+      toEmail,
+      `New Order #${shortId} — ₦${Number(orderDetails.sellerAmount).toLocaleString()} 🔔`,
+      getBaseTemplate(content, '#28a745')
+    );
+  }
+
+  async sendDeliveryConfirmation(toEmail, name, orderId, amount) {
+    const firstName = name?.split(' ')[0] || 'there';
+    const shortId = orderId.slice(-8).toUpperCase();
+    const content = `
+      <h2 style="color:#28a745; text-align:center;">Order Delivered ✅</h2>
+      <p>Hi ${firstName},</p>
+      <p>Your order <strong>#${shortId}</strong> has been marked as delivered and escrow funds have been released to the seller.</p>
+      <div class="amount">₦${Number(amount).toLocaleString()}</div>
+      <p>Thank you for shopping on EliteHub! We hope you love your purchase.</p>
+      <div style="text-align:center;">
+        <a href="https://www.elitehubng.com" class="button" style="background:#28a745;">Leave a Review</a>
+      </div>
+    `;
+    return this.sendEmail(
+      toEmail,
+      `Order #${shortId} Delivered ✅`,
+      getBaseTemplate(content, '#28a745')
+    );
   }
 }
 
