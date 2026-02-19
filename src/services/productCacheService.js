@@ -162,8 +162,8 @@ class ProductCacheService {
       optimized.imageVariants = cdnService.getResponsiveVariants(optimized.imageUrls[0]);
     } else if (typeof optimized.imageUrls === 'string') {
       optimized.imageUrls = cdnService.optimizeUrl(optimized.imageUrls, { 
-        width: 400, 
-        height: 400, 
+        width: 800, 
+        height: 800, 
         crop: 'fit' 
       });
       optimized.imageVariants = cdnService.getResponsiveVariants(optimized.imageUrls);
