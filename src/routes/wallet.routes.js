@@ -128,13 +128,17 @@ router.post(
 
 // ─── POST /api/v1/wallet/add-bank-details ────────────────────────────────────
 
+// ─── POST /api/v1/wallet/add-bank-details ────────────────────────────────────
+// ✅ FIXED: Now saves bankName to bankAccount document so withdrawal route
+// can read it for the transaction description + receipts.
+
 router.post(
   '/add-bank-details',
   authenticate,
   userRateLimit(3, 15 * 60 * 1000),
   async (req, res) => {
     try {
-      const { accountNumber, bankCode, accountName } = req.body;
+      const { accountNumber, bankCode, accountName, bankName } = req.body; // ✅ Accept bankName
       const userId = req.userId;
 
       if (!accountNumber || !bankCode) {
@@ -146,17 +150,24 @@ router.post(
 
       await walletService.ensureWalletExists(userId);
 
+      // 1. Verify account with Paystack
       const verification = await paystackService.verifyBankAccount(accountNumber, bankCode);
       if (!verification.success) {
         return res.status(400).json({ success: false, message: 'Account verification failed. Please check your details.' });
       }
 
+      // 2. Create Paystack transfer recipient (generates a real recipientCode)
       const recipient = await paystackService.createTransferRecipient(
         verification.accountName,
         accountNumber,
         bankCode
       );
 
+      if (!recipient.recipientCode) {
+        return res.status(500).json({ success: false, message: 'Failed to create transfer recipient. Please try again.' });
+      }
+
+      // 3. Save to Firestore — including bankName ✅
       const { updateDocument } = require('../config/firebase');
       await updateDocument('users', userId, {
         paystackRecipientCode: recipient.recipientCode,
@@ -164,13 +175,19 @@ router.post(
           accountName: verification.accountName,
           accountNumber,
           bankCode,
+          bankName: bankName || '',          // ✅ Save the bank name
           verified: true,
           addedAt: Date.now(),
         },
-        updatedAt: Date.now(),
       });
 
-      res.json({ success: true, message: 'Bank details added successfully', accountName: verification.accountName });
+      console.log(`✅ Bank details saved for ${userId}: ${recipient.recipientCode}`);
+
+      res.json({
+        success: true,
+        message: 'Bank details added successfully',
+        accountName: verification.accountName,
+      });
     } catch (error) {
       console.error('❌ Add bank details error:', error);
       res.status(500).json({ success: false, message: error.message || 'Failed to add bank details' });
