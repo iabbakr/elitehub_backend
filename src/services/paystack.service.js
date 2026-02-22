@@ -167,39 +167,44 @@ class PaystackService {
      * Initiate transfer (withdrawal)
      */
     async initiateTransfer(recipientCode, amount, reason = 'Wallet withdrawal') {
-        try {
-            const response = await axios.post(
-                `${PAYSTACK_BASE_URL}/transfer`,
-                {
-                    source: 'balance',
-                    reason,
-                    amount: amount * 100,
-                    recipient: recipientCode
-                },
-                {
-                    headers: {
-                        Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
-                        'Content-Type': 'application/json'
-                    }
+    try {
+        const amountKobo = Math.round(amount * 100); // Ensure integer
+
+        const response = await axios.post(
+            `${PAYSTACK_BASE_URL}/transfer`,
+            {
+                source: 'balance',
+                reason,
+                amount: amountKobo,
+                recipient: recipientCode
+            },
+            {
+                headers: {
+                    Authorization: `Bearer ${PAYSTACK_SECRET_KEY}`,
+                    'Content-Type': 'application/json'
                 }
-            );
-
-            if (!response.data.status) {
-                throw new Error(response.data.message || 'Transfer failed');
             }
+        );
 
-            return {
-                success: true,
-                transferCode: response.data.data.transfer_code,
-                reference: response.data.data.reference,
-                status: response.data.data.status
-            };
-        } catch (error) {
-            console.error('Transfer error:', error.response?.data || error.message);
-            throw new Error(error.response?.data?.message || 'Transfer failed');
+        return {
+            success: true,
+            transferCode: response.data.data.transfer_code,
+            reference: response.data.data.reference,
+            status: response.data.data.status
+        };
+    } catch (error) {
+        // Detailed error for debugging withdrawal failures
+        const errorMessage = error.response?.data?.message || error.message;
+        console.error('❌ Paystack Transfer Error:', errorMessage);
+        
+        // If Paystack says "Insufficient Balance", you need to know immediately
+        if (errorMessage.includes('balance')) {
+            throw new Error('Payout system is temporarily low on funds. Admin has been notified.');
         }
+        
+        throw new Error(errorMessage || 'Transfer failed');
     }
-
+}
     /**
      * ✅ FIXED: Get Nigerian banks list with proper error handling
      */
