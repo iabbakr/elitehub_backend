@@ -13,7 +13,7 @@ exports.getMe = catchAsync(async (req, res, next) => {
   const [userDoc, walletDoc, orderStats] = await Promise.all([
     db.collection('users').doc(userId).get(),
     db.collection('wallets').doc(userId).get(),
-    db.collection('orders').where('buyerId', '==', userId).count().get()
+    db.collection('orders').where('buyerId', '==', userId).count().get(),
   ]);
 
   if (!userDoc.exists) {
@@ -21,7 +21,9 @@ exports.getMe = catchAsync(async (req, res, next) => {
   }
 
   const userData = userDoc.data();
-  const walletData = walletDoc.exists ? walletDoc.data() : { balance: 0, pendingBalance: 0 };
+  const walletData = walletDoc.exists
+    ? walletDoc.data()
+    : { balance: 0, pendingBalance: 0 };
 
   // Remove highly sensitive internal fields before sending to client
   const { paystackRecipientCode, ...safeUserData } = userData;
@@ -33,52 +35,63 @@ exports.getMe = catchAsync(async (req, res, next) => {
       wallet: {
         balance: walletData.balance || 0,
         pendingBalance: walletData.pendingBalance || 0,
-        currency: 'NGN'
+        currency: 'NGN',
       },
       stats: {
-        totalOrders: orderStats.data().count
-      }
-    }
+        totalOrders: orderStats.data().count,
+      },
+    },
   });
 });
 
 /**
  * ✅ POST /api/v1/auth/activate-seller
- * Handles payment and subscription logic in an atomic transaction
+ * Handles payment and subscription logic in an atomic transaction,
+ * then fires a push notification to confirm activation.
  */
 exports.activateSeller = catchAsync(async (req, res, next) => {
   const FEE = 5000;
   const userId = req.userId;
 
   await db.runTransaction(async (t) => {
-    const userRef = db.collection('users').doc(userId);
+    const userRef   = db.collection('users').doc(userId);
     const walletRef = db.collection('wallets').doc(userId);
     // Use a high-entropy ID for the transaction ledger
-    const txnRef = db.collection('transactions').doc(`sub_${Date.now()}_${userId.slice(0, 4)}`);
+    const txnRef = db
+      .collection('transactions')
+      .doc(`sub_${Date.now()}_${userId.slice(0, 4)}`);
 
-    const [userSnap, walletSnap] = await Promise.all([t.get(userRef), t.get(walletRef)]);
+    const [userSnap, walletSnap] = await Promise.all([
+      t.get(userRef),
+      t.get(walletRef),
+    ]);
 
     if (!userSnap.exists) throw new AppError('User profile not found', 404);
-    
-    const walletData = walletSnap.exists ? walletSnap.data() : { balance: 0 };
+
+    const walletData = walletSnap.exists
+      ? walletSnap.data()
+      : { balance: 0 };
 
     if (walletData.balance < FEE) {
-      throw new AppError('Insufficient balance to activate shop. Please top up your wallet.', 400);
+      throw new AppError(
+        'Insufficient balance to activate shop. Please top up your wallet.',
+        400
+      );
     }
 
     // 1. Update User Profile to Active Seller status
     t.update(userRef, {
-      subscriptionExpiresAt: Date.now() + (365 * 24 * 60 * 60 * 1000), // 1 Year
+      subscriptionExpiresAt: Date.now() + 365 * 24 * 60 * 60 * 1000, // 1 Year
       subscriptionType: 'yearly',
       hasCompletedBusinessProfile: true,
       role: 'seller', // Ensure role is promoted if they were a buyer
-      updatedAt: Date.now()
+      updatedAt: Date.now(),
     });
 
     // 2. Debit Wallet atomically
-    t.update(walletRef, { 
+    t.update(walletRef, {
       balance: admin.firestore.FieldValue.increment(-FEE),
-      updatedAt: admin.firestore.FieldValue.serverTimestamp()
+      updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     });
 
     // 3. Log the transaction ledger
@@ -90,24 +103,57 @@ exports.activateSeller = catchAsync(async (req, res, next) => {
       category: 'subscription_payment',
       description: 'Annual Merchant Shop Activation Fee',
       status: 'completed',
-      timestamp: Date.now()
+      timestamp: Date.now(),
     });
   });
 
-  res.status(200).json({ 
-    success: true, 
-    message: 'Congratulations! Your shop has been activated for 1 year.' 
+  // 4. Fire push notification (non-blocking — failure must not break the response)
+  setImmediate(async () => {
+    try {
+      const pushNotificationService = require('../services/push-notification.service');
+      await pushNotificationService.sendPushToUser(
+        userId,
+        '🎉 Shop Activated!',
+        'Your EliteHub seller account is now active for 1 year. Start listing products!',
+        {
+          screen: 'ProfileTab',
+          params: { screen: 'SellerDashboard' },
+          type: 'system',
+        },
+        'default'
+      );
+    } catch (err) {
+      console.error('[activateSeller] Push notification failed:', err);
+    }
+  });
+
+  res.status(200).json({
+    success: true,
+    message: 'Congratulations! Your shop has been activated for 1 year.',
   });
 });
 
 /**
  * ✅ POST /api/v1/auth/signout
- * Optional server-side cleanup if using session tokens or Redis blacklists
+ * Optional server-side cleanup if using session tokens or Redis blacklists.
  */
 exports.signOut = catchAsync(async (req, res, next) => {
-  // If you use Redis to blacklist JWTs, handle it here
-  res.status(200).json({ 
-    success: true, 
-    message: 'Successfully signed out' 
+  // Optionally clear push token on signout so the user stops receiving
+  // notifications while logged out.
+  setImmediate(async () => {
+    try {
+      const userId = req.userId;
+      if (userId) {
+        await db.collection('pushTokens').doc(userId).delete();
+        console.log(`[signOut] Push token cleared for user ${userId}`);
+      }
+    } catch (err) {
+      console.error('[signOut] Failed to clear push token:', err);
+    }
+  });
+
+  res.status(200).json({
+    success: true,
+    message: 'Successfully signed out',
   });
 });
