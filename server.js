@@ -51,7 +51,9 @@ const activityRoutes = require('./src/routes/activity.routes');
 const supportRoutes = require('./src/routes/support.routes');
 const serviceProviderRoutes = require('./src/routes/service-provider.routes'); 
 const otpRoutes = require('./src/routes/otp.routes'); // 👈 Add this import
-const referralRoutes        = require('./src/routes/referral.routes'); // ✅ NEW
+const referralRoutes = require('./src/routes/referral.routes'); // ✅ NEW
+const otpUpgradeRoutes = require('./src/routes/otp-upgrade.routes');
+const upgradeRoutes    = require('./src/routes/upgrade.routes');
 
 
 const app = express();
@@ -216,7 +218,10 @@ app.use('/api/v1/activity', activityRoutes);
 app.use('/api/v1/support', supportRoutes);
 app.use('/api/v1/service-providers', serviceProviderRoutes);
 app.use('/api/v1/otp', otpRoutes); // 👈 Add this line
-app.use('/api/v1/referrals',        referralRoutes); // ✅ NEW
+app.use('/api/v1/referrals', referralRoutes); // ✅ NEW
+app.use('/api/v1/otp',   otpUpgradeRoutes);   // adds /send-verification-upgrade & /verify-upgrade-email
+app.use('/api/v1/users', upgradeRoutes);       // adds /upgrade-role (auth required)
+//
 
 
 app.all('*', (req, res, next) => {
