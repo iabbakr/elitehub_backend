@@ -73,6 +73,24 @@ const authenticate = async (req, res, next) => {
 };
 
 /**
+ * 🔒 Internal-only middleware
+ * Guard for routes that should only be called by other backend services
+ */
+const internalOnly = (req, res, next) => {
+    const internalSecret = req.headers['x-internal-secret'];
+    
+    // Ensure you have INTERNAL_SECRET defined in your .env file
+    if (!internalSecret || internalSecret !== process.env.INTERNAL_SECRET) {
+        console.warn(`🚨 Unauthorized internal access attempt from IP: ${req.ip}`);
+        return res.status(403).json({
+            success: false,
+            message: 'Forbidden: Internal access only'
+        });
+    }
+    next();
+};
+
+/**
  * Optional authentication - doesn't fail if no token
  */
 const optionalAuth = async (req, res, next) => {
@@ -319,5 +337,6 @@ module.exports = {
     sellerOrAdmin,
     serviceOrAdmin,
     userRateLimit,
-    validateBody
+    validateBody,
+    internalOnly
 };

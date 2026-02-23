@@ -1,3 +1,5 @@
+'use strict';
+
 const { db, admin } = require('../config/firebase');
 const { getDocument, updateDocument } = require('../config/firebase');
 const { client } = require('../config/redis');
@@ -51,6 +53,7 @@ function validateOrderAccess(order, userId, requiredRole) {
 async function invalidateOrderCaches(orderId, buyerId, sellerId) {
     await Promise.all([
         client.del(`order:${orderId}`),
+        client.del(`order_full:${orderId}`),
         client.del(`orders:${buyerId}:all:all`),
         client.del(`orders:${sellerId}:all:all`),
         client.del(`orders:${buyerId}:buyer:running`),
@@ -69,10 +72,6 @@ function getTrackingMessage(status) {
     };
     return messages[status] || 'Order status updated';
 }
-
-// ==========================================
-// 1. GET ORDERS
-// ==========================================
 
 // ==========================================
 // 1. GET ORDERS
@@ -162,12 +161,10 @@ exports.createOrder = catchAsync(async (req, res, next) => {
     } = req.body;
     const buyerId = req.userId;
 
-    // Validation
     if (!products?.length || !deliveryAddress) {
         return next(new AppError('Missing required fields', 400));
     }
 
-    // Get first product to determine seller
     const firstProduct = await getDocument('products', products[0].productId);
     if (!firstProduct) {
         return next(new AppError('Product not found', 404));
@@ -175,13 +172,11 @@ exports.createOrder = catchAsync(async (req, res, next) => {
 
     const sellerId = firstProduct.sellerId;
 
-    // Guard: Check if seller is suspended
     const sellerDoc = await getDocument('users', sellerId);
     if (sellerDoc?.isSuspended) {
         return next(new AppError('This shop is currently inactive.', 403));
     }
 
-    // Duplicate prevention lock
     const createLockKey = `order:create:${buyerId}:${Date.now()}`;
     const isCreating = await client.get(createLockKey);
     if (isCreating) {
@@ -193,7 +188,6 @@ exports.createOrder = catchAsync(async (req, res, next) => {
     await client.setEx(createLockKey, 30, 'true');
 
     try {
-        // Calculate totals and validate stock
         let subtotal = 0;
         const orderProducts = [];
         const productUpdates = [];
@@ -232,20 +226,17 @@ exports.createOrder = catchAsync(async (req, res, next) => {
         const totalAmount = Math.round(subtotal - discount + deliveryFee);
         const commission = Math.round(totalAmount * PLATFORM_COMMISSION_RATE);
 
-        // Check wallet balance
         const buyerBalance = await walletService.getBalance(buyerId);
         if (buyerBalance < totalAmount) {
             await client.del(createLockKey);
             return next(new AppError('Insufficient wallet balance', 400));
         }
 
-        // ATOMIC TRANSACTION: Create order + Update stock
         let orderId;
         await db.runTransaction(async (transaction) => {
             const orderRef = db.collection('orders').doc();
             orderId = orderRef.id;
 
-            // Create order
             transaction.set(orderRef, {
                 id: orderId,
                 buyerId,
@@ -265,7 +256,6 @@ exports.createOrder = catchAsync(async (req, res, next) => {
                 updatedAt: Date.now(),
             });
 
-            // Update product stock
             for (const update of productUpdates) {
                 if (update.newStock <= 0) {
                     transaction.delete(update.ref);
@@ -275,7 +265,6 @@ exports.createOrder = catchAsync(async (req, res, next) => {
             }
         });
 
-        // Process escrow payment
         await walletService.processOrderPayment(
             buyerId, 
             sellerId, 
@@ -284,7 +273,6 @@ exports.createOrder = catchAsync(async (req, res, next) => {
             commission
         );
 
-        // Notify seller
         await pushNotificationService.sendPushToUser(
             sellerId,
             "New Order Received! 🎉",
@@ -292,7 +280,6 @@ exports.createOrder = catchAsync(async (req, res, next) => {
             { screen: "OrdersTab", params: { screen: "Orders" } }
         );
 
-        // Cleanup
         await Promise.all([
             client.del(createLockKey),
             invalidateOrderCaches(orderId, buyerId, sellerId)
@@ -533,7 +520,6 @@ exports.updateTracking = catchAsync(async (req, res, next) => {
             return next(new AppError(`Cannot update tracking for ${order.status} orders`, 400));
         }
 
-        // Prevent backwards tracking
         const trackingOrder = ['acknowledged', 'enroute', 'ready_for_pickup'];
         const currentIndex = trackingOrder.indexOf(order.trackingStatus);
         const newIndex = trackingOrder.indexOf(status);
@@ -604,7 +590,6 @@ exports.cancelOrderBuyer = catchAsync(async (req, res, next) => {
         const order = await getFreshOrderWithLock(orderId, lockKey);
         validateOrderAccess(order, req.userId, 'buyer');
 
-        // CRITICAL GUARD: Cannot cancel after seller acknowledgment
         if (order.trackingStatus) {
             await client.del(lockKey);
             return res.status(403).json({ 
@@ -621,7 +606,6 @@ exports.cancelOrderBuyer = catchAsync(async (req, res, next) => {
 
         await db.runTransaction(async (transaction) => {
             const orderRef = db.collection('orders').doc(orderId);
-            
             transaction.update(orderRef, {
                 status: 'cancelled',
                 cancelReason: reason.trim(),
@@ -704,16 +688,15 @@ exports.cancelOrderSeller = catchAsync(async (req, res, next) => {
                 updatedAt: Date.now()
             });
 
-            // ⚠️ Automatic Strike: Only if order was already acknowledged
-    if (order.trackingStatus) {
-        transaction.update(sellerRef, {
-            autoCancelStrikes: admin.firestore.FieldValue.increment(1),
-            // Auto-suspend if they hit 3 strikes
-            isSuspended: (sellerData.autoCancelStrikes || 0) + 1 >= 3,
-            suspensionReason: (sellerData.autoCancelStrikes || 0) + 1 >= 3 
-                ? 'Automated suspension: Multiple cancellations after order confirmation' 
-                : null
-        });
+            // ⚠️ Auto-strike only if order was already acknowledged
+            if (order.trackingStatus) {
+                transaction.update(sellerRef, {
+                    autoCancelStrikes: admin.firestore.FieldValue.increment(1),
+                    isSuspended: (sellerData.autoCancelStrikes || 0) + 1 >= 3,
+                    suspensionReason: (sellerData.autoCancelStrikes || 0) + 1 >= 3 
+                        ? 'Automated suspension: Multiple cancellations after order confirmation' 
+                        : null
+                });
             }
         });
 
@@ -752,7 +735,10 @@ exports.cancelOrderSeller = catchAsync(async (req, res, next) => {
 
 /**
  * PUT /api/v1/orders/:orderId/confirm-delivery
- * Buyer confirms delivery and releases payment
+ *
+ * Buyer confirms delivery → releases escrow to seller.
+ * After escrow is confirmed, triggers referral bonus check fire-and-forget.
+ * Referral failure is INTENTIONALLY non-fatal — delivery is already confirmed.
  */
 exports.confirmDelivery = catchAsync(async (req, res, next) => {
     const { orderId } = req.params;
@@ -781,6 +767,7 @@ exports.confirmDelivery = catchAsync(async (req, res, next) => {
             return next(new AppError('Order must be marked as delivered by seller first', 400));
         }
 
+        // ── 1. Release escrow (atomic + idempotent) ─────────────────────────
         const releaseResult = await walletService.releaseEscrow(
             orderId,
             order.buyerId,
@@ -798,6 +785,32 @@ exports.confirmDelivery = catchAsync(async (req, res, next) => {
             });
         }
 
+        // ── 2. 🎁 Referral bonus — fire-and-forget via internal HTTP call ──
+        // Using setImmediate ensures this runs AFTER the response is flushed.
+        // Any failure is caught and logged — never propagates to the buyer.
+        if (!releaseResult.alreadyProcessed) {
+            setImmediate(async () => {
+                try {
+                    const axios = require('axios');
+                    await axios.post(
+                        `${process.env.API_BASE_URL}/api/v1/referrals/release`,
+                        { buyerId: order.buyerId, orderId },
+                        {
+                            headers: {
+                                'X-Internal-Secret': process.env.INTERNAL_SECRET,
+                                'Content-Type': 'application/json',
+                            },
+                            timeout: 10_000,
+                        }
+                    );
+                } catch (err) {
+                    // Non-fatal — escrow is already released, buyer is confirmed.
+                    console.error(`[Referral] Auto-release failed for order ${orderId} (non-fatal):`, err.message);
+                }
+            });
+        }
+
+        // ── 3. Notify seller ─────────────────────────────────────────────────
         await pushNotificationService.sendPushToUser(
             order.sellerId,
             "💸 Payment Released",
@@ -805,6 +818,7 @@ exports.confirmDelivery = catchAsync(async (req, res, next) => {
             { screen: "OrdersTab" }
         );
 
+        // ── 4. Cleanup ────────────────────────────────────────────────────────
         await Promise.all([
             client.del(lockKey),
             invalidateOrderCaches(orderId, order.buyerId, order.sellerId)
