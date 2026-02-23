@@ -82,13 +82,37 @@ app.use(hpp({      // Prevent HTTP Parameter Pollution
   whitelist: ['price', 'category', 'rating', 'stock', 'status'] 
 }));
 
+// --- CORS Configuration ---
+const allowedOrigins = process.env.ALLOWED_ORIGINS 
+  ? process.env.ALLOWED_ORIGINS.split(',') 
+  : [];
+
 app.use(cors({
-  origin: process.env.NODE_ENV === 'production' 
-    ? ['https://elitehubng.com', 'https://www.elitehubng.com', "https://www.elitehubng.com", "https://www.elitehubng.com/"]
-    : ['http://localhost:8081', 'http://192.168.100.142:8081', '*'],
+  origin: (origin, callback) => {
+    // 1. Allow requests with no origin (like mobile apps or curl)
+    if (!origin) return callback(null, true);
+
+    // 2. In Production: Check against whitelisted origins
+    if (process.env.NODE_ENV === 'production') {
+      if (allowedOrigins.indexOf(origin) !== -1) {
+        return callback(null, true);
+      } else {
+        return callback(new Error('Not allowed by CORS'));
+      }
+    }
+
+    // 3. In Development: Allow local dev tools (Expo/Localhost)
+    const developmentOrigins = ['http://localhost:8081', 'http://192.168.100.142:8081'];
+    if (developmentOrigins.includes(origin) || origin.startsWith('http://192.168.')) {
+      return callback(null, true);
+    }
+
+    // Fallback for dev
+    callback(null, true); 
+  },
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'x-cache']
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'Accept', 'x-cache']
 }));
 
 app.use(compression());
