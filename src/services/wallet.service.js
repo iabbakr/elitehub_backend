@@ -563,105 +563,147 @@ async releaseEscrow(orderId, buyerId, sellerId, totalAmount, commission) {
 }
 
     /**
-     * ✅ FIXED: Safe refund with proper transaction handling
-     */
-    async refundEscrow(orderId, buyerId, sellerId, totalAmount, commission, reason) {
-        const lockKey = `refund:lock:${orderId}`;
+ * ✅ FIXED: Refund escrow — handles both delivery scenarios and cancellations
+ */
+async refundEscrow(orderId, buyerId, sellerId, totalAmount, commission, reason) {
+    const lockKey = `refund:lock:${orderId}`;
 
-        try {
-            const isProcessed = await client.get(lockKey);
-            if (isProcessed) return { success: true, alreadyProcessed: true };
+    try {
+        const isProcessed = await client.get(lockKey);
+        if (isProcessed) return { success: true, alreadyProcessed: true };
 
-            await client.setEx(lockKey, 86400, 'true');
+        await client.setEx(lockKey, 86400, 'true');
 
-            const buyerRef = db.collection('wallets').doc(buyerId);
-            const sellerRef = db.collection('wallets').doc(sellerId);
-            const orderRef = db.collection('orders').doc(orderId);
+        const buyerRef = db.collection('wallets').doc(buyerId);
+        const sellerRef = db.collection('wallets').doc(sellerId);
+        const orderRef = db.collection('orders').doc(orderId);
+        const buyerOriginalTxnRef = buyerRef.collection('transactions').doc(`pay_${orderId}`);
 
-            await db.runTransaction(async (transaction) => {
-                const buyerOriginalTxnRef = buyerRef.collection('transactions').doc(`pay_${orderId}`);
-                const sellerTxnRef = sellerRef.collection('transactions').doc(`order_${orderId}`);
-                
-                const [orderDoc, originalSnap, sellerTxnSnap] = await Promise.all([
-                    transaction.get(orderRef),
-                    transaction.get(buyerOriginalTxnRef),
-                    transaction.get(sellerTxnRef)
-                ]);
-                
-                if (!orderDoc.exists) throw new Error("Order not found");
-                if (orderDoc.data().status === 'delivered') throw new Error("Cannot refund delivered orders");
+        const result = await db.runTransaction(async (transaction) => {
+            // PHASE 1: ALL READS FIRST
+            const sellerTxnRef = sellerRef.collection('transactions').doc(`order_${orderId}`);
+            
+            const [orderDoc, sellerDoc, buyerDoc, buyerTxnSnap, sellerTxnSnap] = await Promise.all([
+                transaction.get(orderRef),
+                transaction.get(sellerRef),
+                transaction.get(buyerRef),
+                transaction.get(buyerOriginalTxnRef),
+                transaction.get(sellerTxnRef)
+            ]);
 
-                // 1️⃣ Update buyer's original transaction
-                if (originalSnap.exists) {
-                    transaction.update(buyerOriginalTxnRef, {
-                        status: 'refunded',
-                        description: `Order #${orderId.slice(-6).toUpperCase()} - Refunded`,
-                        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                    });
+            if (!orderDoc.exists) throw new Error("Order not found");
+            const orderData = orderDoc.data();
+
+            // ✅ FIX: Accept both 'running' AND 'cancelled' statuses
+            // 'running' = order is active, 'cancelled' = seller just cancelled it
+            const validStatuses = ['running', 'cancelled'];
+            if (!validStatuses.includes(orderData.status)) {
+                throw new Error(`Cannot refund order with status: ${orderData.status}`);
+            }
+
+            if (orderData.status === 'delivered') {
+                return { success: true, alreadyProcessed: true };
+            }
+
+            if (!sellerDoc.exists || !buyerDoc.exists) {
+                throw new Error("Wallet not found");
+            }
+
+            // PHASE 2: ALL WRITES AFTER
+            
+            // 1. Update buyer's original payment transaction
+            if (buyerTxnSnap.exists) {
+                transaction.update(buyerOriginalTxnRef, {
+                    status: 'refunded',
+                    description: `Order #${orderId.slice(-6).toUpperCase()} - Refunded`,
+                    refundedAt: Date.now(),
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+            }
+
+            // 2. Create refund credit for buyer
+            const refundTxnId = `refund_${orderId}`;
+            const refundTxnRef = buyerRef.collection('transactions').doc(refundTxnId);
+            transaction.set(refundTxnRef, {
+                id: refundTxnId,
+                userId: buyerId,
+                type: 'credit',
+                category: 'order_refund',
+                amount: totalAmount,
+                description: `Refund: Order #${orderId.slice(-6).toUpperCase()}`,
+                timestamp: Date.now(),
+                status: 'completed',
+                metadata: { 
+                    orderId, 
+                    reason, 
+                    refundType: 'order_cancellation',
+                    reference: refundTxnId
                 }
-
-                // 2️⃣ Create refund credit
-                const refundTxnId = `refund_${orderId}`;
-                const refundTxnRef = buyerRef.collection('transactions').doc(refundTxnId);
-                transaction.set(refundTxnRef, {
-                    id: refundTxnId,
-                    userId: buyerId,
-                    type: 'credit',
-                    category: 'order_refund',
-                    amount: totalAmount,
-                    description: `Refund: Order #${orderId.slice(-6).toUpperCase()}`,
-                    timestamp: Date.now(),
-                    status: 'completed',
-                    metadata: { 
-                        orderId, 
-                        reason, 
-                        refundType: 'order_cancellation',
-                        reference: refundTxnId
-                    }
-                });
-
-                transaction.update(buyerRef, {
-                    balance: admin.firestore.FieldValue.increment(totalAmount),
-                    pendingBalance: admin.firestore.FieldValue.increment(-totalAmount),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                // 3️⃣ Update seller's transaction if it exists
-                if (sellerTxnSnap.exists) {
-                    transaction.update(sellerTxnRef, {
-                        status: 'cancelled',
-                        description: `Order #${orderId.slice(-6).toUpperCase()} - Cancelled`,
-                        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                    });
-                }
-
-                transaction.update(sellerRef, {
-                    pendingBalance: admin.firestore.FieldValue.increment(-(totalAmount - commission)),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                transaction.update(orderRef, {
-                    status: 'cancelled',
-                    cancelReason: reason,
-                    cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
             });
 
-            await this.invalidateWalletCache(buyerId);
-            await this.invalidateWalletCache(sellerId);
+            // 3. Update buyer balance
+            transaction.update(buyerRef, {
+                balance: admin.firestore.FieldValue.increment(totalAmount),
+                pendingBalance: admin.firestore.FieldValue.increment(-totalAmount),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
 
-            await pushNotificationService.sendTransactionAlert(buyerId, 'refunded', totalAmount, orderId);
+            // ✅ FIX: Update seller's transaction to 'cancelled' (not stuck at pending)
+            if (sellerTxnSnap.exists) {
+                transaction.update(sellerTxnRef, {
+                    status: 'cancelled',
+                    category: 'order_cancelled',  // Clear category
+                    description: `Order #${orderId.slice(-6).toUpperCase()} - Cancelled`,
+                    cancelledAt: Date.now(),
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+            } else {
+                // Fallback: create cancelled transaction record
+                console.warn(`⚠️ Seller transaction not found for order ${orderId}, creating cancel record`);
+                transaction.set(sellerTxnRef, {
+                    id: `order_${orderId}`,
+                    userId: sellerId,
+                    type: 'credit',
+                    category: 'order_cancelled',
+                    amount: 0,  // No credit given
+                    description: `Order #${orderId.slice(-6).toUpperCase()} - Cancelled`,
+                    timestamp: Date.now(),
+                    status: 'cancelled',
+                    metadata: { orderId, reason, fallbackCreated: true }
+                });
+            }
 
-            console.log(`✅ Refund processed for order ${orderId}`);
+            // 4. Update seller balance (remove pending credit)
+            transaction.update(sellerRef, {
+                pendingBalance: admin.firestore.FieldValue.increment(-(totalAmount - commission)),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
+            // 5. Update order status (if not already done)
+            transaction.update(orderRef, {
+                status: 'cancelled',
+                cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp()
+            });
+
             return { success: true, alreadyProcessed: false };
+        });
 
-        } catch (error) {
-            console.error(`❌ Refund escrow error for ${orderId}:`, error);
-            if (!error.message?.includes('delivered')) await client.del(lockKey);
-            throw error;
+        await this.invalidateWalletCache(buyerId);
+        await this.invalidateWalletCache(sellerId);
+
+        console.log(`✅ Refund processed for order ${orderId}`);
+        return result;
+
+    } catch (error) {
+        console.error(`❌ Refund escrow error for ${orderId}:`, error);
+        // Only delete lock if it's not a "delivery" issue
+        if (!error.message?.includes('delivered')) {
+            await client.del(lockKey);
         }
+        throw error;
     }
+}
 
     /**
  * ✅ ATOMIC DISPUTE RESOLUTION: Release to Seller
