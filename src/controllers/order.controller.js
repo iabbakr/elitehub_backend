@@ -73,6 +73,43 @@ function getTrackingMessage(status) {
     return messages[status] || 'Order status updated';
 }
 
+// ── FIX: Notify each unique seller after a successful bundle order ────────────
+// Called via setImmediate AFTER the transaction commits so it's non-blocking
+// and a notification failure can never roll back a completed purchase.
+async function notifySellersAfterBundle(subOrders, orderIds) {
+    const notifPromises = subOrders.map((subOrder, index) => {
+        const orderId = orderIds[index];
+        if (!orderId || !subOrder.sellerId) return Promise.resolve();
+
+        const itemTotal = subOrder.items.reduce(
+            (sum, item) => sum + item.price * item.quantity,
+            0
+        );
+        const orderTotal = Math.round(
+            itemTotal - (subOrder.discount || 0) + (subOrder.deliveryFee || 0)
+        );
+        const shortId = orderId.slice(-6).toUpperCase();
+
+        return pushNotificationService
+            .sendOrderAlert(
+                subOrder.sellerId,
+                'order_new',
+                orderId,
+                '🎉 New Order Received!',
+                `Order #${shortId} • ₦${orderTotal.toLocaleString('en-NG')} — tap to confirm`,
+                { requiresAction: true }
+            )
+            .catch((err) =>
+                console.error(
+                    `[Bundle] Seller notify failed for ${subOrder.sellerId}:`,
+                    err.message
+                )
+            );
+    });
+
+    await Promise.allSettled(notifPromises);
+}
+
 // ==========================================
 // 1. GET ORDERS
 // ==========================================
@@ -482,6 +519,15 @@ exports.createBundleOrder = catchAsync(async (req, res, next) => {
                 updatedAt: Date.now()
             });
         });
+    });
+
+    // ── FIX: Notify sellers after transaction — non-blocking via setImmediate ──
+    // setImmediate ensures the response is sent first, so a slow/failed push
+    // notification never delays or breaks the buyer's checkout confirmation.
+    setImmediate(() => {
+        notifySellersAfterBundle(subOrders, orderIds).catch((err) =>
+            console.error('[Bundle] Seller notification batch error:', err)
+        );
     });
 
     res.json({
