@@ -628,12 +628,13 @@ async releaseEscrow(orderId, buyerId, sellerId, totalAmount, commission) {
 
                 // 3️⃣ Update seller's transaction if it exists
                 if (sellerTxnSnap.exists) {
-                    transaction.update(sellerTxnRef, {
-                        status: 'cancelled',
-                        description: `Order #${orderId.slice(-6).toUpperCase()} - Cancelled`,
-                        updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                    });
-                }
+    transaction.update(sellerTxnRef, {
+        status: 'cancelled',
+        category: 'order_release',  // ← the actual fix goes HERE
+        description: `Order #${orderId.slice(-6).toUpperCase()} - Cancelled`,
+        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+    });
+}
 
                 transaction.update(sellerRef, {
                     pendingBalance: admin.firestore.FieldValue.increment(-(totalAmount - commission)),
