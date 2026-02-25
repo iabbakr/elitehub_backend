@@ -468,6 +468,9 @@ exports.createBundleOrder = catchAsync(async (req, res, next) => {
                 updatedAt: Date.now()
             });
 
+            // ✅ FIX [Bug 2]: Added `reference` to buyer transaction metadata.
+            // Previously this was missing, causing TransactionDetailScreen and
+            // TransactionReceiptScreen to display "Reference: N/A" for buyers.
             const buyerTxnRef = db.collection(`wallets/${buyerId}/transactions`).doc(`pay_${data.orderId}`);
             transaction.set(buyerTxnRef, {
                 id: `pay_${data.orderId}`,
@@ -478,7 +481,10 @@ exports.createBundleOrder = catchAsync(async (req, res, next) => {
                 description: `Order #${data.orderId.slice(-6).toUpperCase()} - Escrow Hold`,
                 status: 'pending',
                 timestamp: Date.now(),
-                metadata: { orderId: data.orderId }
+                metadata: {
+                    orderId: data.orderId,
+                    reference: `pay_${data.orderId}` // ✅ FIX [Bug 2]: was missing
+                }
             });
 
             const sellerTxnRef = db.collection(`wallets/${data.sellerId}/transactions`).doc();
