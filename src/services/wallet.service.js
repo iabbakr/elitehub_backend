@@ -152,12 +152,174 @@ class WalletService {
         }
     }
 
+    async initializeWithdrawal(userId, userEmail, userName, payload) {
+        const { amountKobo, accountNumber, bankCode, accountName } = payload;
+        const amountNaira = amountKobo / 100;
+        const reference = `wd_${Date.now()}_${userId.slice(0, 5)}`;
+        const lockKey = `withdraw:lock:${reference}`;
+
+        try {
+            await this._verifyWalletStatus(userId);
+
+            const result = await db.runTransaction(async (transaction) => {
+                const walletRef = db.collection('wallets').doc(userId);
+                const userRef   = db.collection('users').doc(userId);
+                const txnRef    = db.collection('transactions').doc(`txn_${reference}`);
+
+                const [walletSnap, userSnap] = await Promise.all([
+                    transaction.get(walletRef),
+                    transaction.get(userRef)
+                ]);
+
+                if (!walletSnap.exists) throw new Error('Wallet not found');
+                const wallet = walletSnap.data();
+
+                if (wallet.balance < amountNaira) {
+                    throw new Error('Insufficient balance');
+                }
+
+                const userData = userSnap.data();
+                if (!userData.paystackRecipientCode) {
+                    throw new Error('Bank recipient not found. Please link your bank account again.');
+                }
+
+                transaction.set(txnRef, {
+                    id: reference,
+                    userId,
+                    type: 'debit',
+                    amount: amountNaira,
+                    description: `Withdrawal to ${accountName} (${bankCode})`,
+                    status: 'processing',
+                    timestamp: Date.now(),
+                    metadata: {
+                        withdrawal: true,
+                        accountNumber,
+                        bankCode,
+                        accountName,
+                        reference
+                    }
+                });
+
+                transaction.update(walletRef, {
+                    balance: admin.firestore.FieldValue.increment(-amountNaira),
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+
+                return { recipientCode: userData.paystackRecipientCode };
+            });
+
+            const transfer = await paystackService.initiateTransfer(
+                result.recipientCode,
+                amountNaira,
+                `EliteHub Payout: ${reference}`
+            );
+
+            await client.setEx(lockKey, 86400, 'true');
+            await this.invalidateWalletCache(userId);
+
+            try {
+                await emailService.sendWithdrawalConfirmation(userEmail, userName, amountNaira, {
+                    accountName,
+                    bankName: 'Verified Bank',
+                    accountNumber
+                });
+            } catch (err) {
+                console.warn('📧 Notification failed but withdrawal succeeded:', err.message);
+            }
+
+            return {
+                success: true,
+                reference: transfer.reference,
+                amount: amountNaira
+            };
+
+        } catch (error) {
+            console.error(`❌ Withdrawal Initialization Error for ${userId}:`, error.message);
+            throw error;
+        }
+    }
+
     async invalidateWalletCache(userId) {
         try {
             const keys = [`wallet:cache:${userId}`, `wallet:balance:${userId}`];
             await Promise.all(keys.map(key => client.del(key)));
         } catch (error) {
             console.warn('⚠️  Cache invalidation error:', error);
+        }
+    }
+
+    async initializeWithdrawal(userId, userEmail, userName, payload) {
+        const { amountKobo, accountNumber, bankCode, accountName } = payload;
+        const amountNaira = amountKobo / 100;
+        const reference = `wd_${Date.now()}_${userId.slice(0, 5)}`;
+        const lockKey = `withdraw:lock:${reference}`;
+
+        try {
+            await this._verifyWalletStatus(userId);
+
+            const result = await db.runTransaction(async (transaction) => {
+                const walletRef = db.collection('wallets').doc(userId);
+                const userRef   = db.collection('users').doc(userId);
+                const txnRef    = db.collection('transactions').doc(`txn_${reference}`);
+
+                const [walletSnap, userSnap] = await Promise.all([
+                    transaction.get(walletRef),
+                    transaction.get(userRef)
+                ]);
+
+                if (!walletSnap.exists) throw new Error('Wallet not found');
+                const wallet = walletSnap.data();
+
+                if (wallet.balance < amountNaira) throw new Error('Insufficient balance');
+
+                const userData = userSnap.data();
+                if (!userData.paystackRecipientCode) {
+                    throw new Error('Bank recipient not found. Please link your bank account again.');
+                }
+
+                transaction.set(txnRef, {
+                    id: reference,
+                    userId,
+                    type: 'debit',
+                    amount: amountNaira,
+                    description: `Withdrawal to ${accountName} (${bankCode})`,
+                    status: 'processing',
+                    timestamp: Date.now(),
+                    metadata: { withdrawal: true, accountNumber, bankCode, accountName, reference }
+                });
+
+                transaction.update(walletRef, {
+                    balance: admin.firestore.FieldValue.increment(-amountNaira),
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+
+                return { recipientCode: userData.paystackRecipientCode };
+            });
+
+            const transfer = await paystackService.initiateTransfer(
+                result.recipientCode,
+                amountNaira,
+                `EliteHub Payout: ${reference}`
+            );
+
+            await client.setEx(lockKey, 86400, 'true');
+            await this.invalidateWalletCache(userId);
+
+            try {
+                await emailService.sendWithdrawalConfirmation(userEmail, userName, amountNaira, {
+                    accountName,
+                    bankName: 'Verified Bank',
+                    accountNumber
+                });
+            } catch (err) {
+                console.warn('📧 Notification failed but withdrawal succeeded:', err.message);
+            }
+
+            return { success: true, reference: transfer.reference, amount: amountNaira };
+
+        } catch (error) {
+            console.error(`❌ Withdrawal Initialization Error for ${userId}:`, error.message);
+            throw error;
         }
     }
 
