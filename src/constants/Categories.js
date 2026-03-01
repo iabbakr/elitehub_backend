@@ -25,6 +25,7 @@ const SELLERS_CATEGORIES = [
       "Smart_Speakers",
       "Smart_Watches",
       "Wearable_Technology",
+      "Other",
     ],
   },
   {
@@ -46,6 +47,7 @@ const SELLERS_CATEGORIES = [
       "Computer_Accessories",
       "Storage_Devices",
       "Software",
+      "Other",
     ],
   },
   {
@@ -65,6 +67,7 @@ const SELLERS_CATEGORIES = [
       "Video_Games",
       "Gaming_Accessories",
       "Projectors",
+      "Other",
     ],
   },
   {
@@ -96,6 +99,7 @@ const SELLERS_CATEGORIES = [
       "Photography_Accessories",
       "Camera_Lenses",
       "Camera_Filters",
+      "Other",
     ],
   },
 
@@ -197,6 +201,7 @@ const SELLERS_CATEGORIES = [
       "Hair_Removal",
       "Mens_Grooming",
       "Bath_Body",
+      "Other",
     ],
   },
 
@@ -206,6 +211,7 @@ const SELLERS_CATEGORIES = [
     icon: "truck",
     subcategories: [
       "Sedans",
+      "SUVs",
       "MPVs",
       "Crossover",
       "SUVs_Crossovers",
@@ -326,6 +332,7 @@ const SELLERS_CATEGORIES = [
       "Vacuum_Cleaners",
       "Steam_Cleaners",
       "Accessories",
+      "Other",
     ],
   },
   {
@@ -357,6 +364,7 @@ const SELLERS_CATEGORIES = [
       "Office_Furniture",
       "Outdoor_Furniture",
       "TV_Stands",
+      "Other",
     ],
   },
   {
@@ -372,7 +380,9 @@ const SELLERS_CATEGORIES = [
       "Beddings",
       "Mirrors",
       "Artificial_Flowers",
+      "Kitchen_Accessories",
       "Accessories",
+      "Other",
     ],
   },
   {
@@ -397,6 +407,7 @@ const SELLERS_CATEGORIES = [
       "Kitchen_Islands",
       "Kitchen_Countertops",
       "Accessories",
+      "Other",
     ],
   },
 
@@ -417,7 +428,7 @@ const SELLERS_CATEGORIES = [
       "Herbs_Sauces",
       "Herbs_Seasonings",
       "Organic_Produce",
-      "Accessories",
+      "Other",
     ],
   },
   {
@@ -480,6 +491,7 @@ const SELLERS_CATEGORIES = [
       "Flour",
       "Yam_Tubers",
       "Sweet_Potatoes",
+      "Other",
     ],
   },
   {
@@ -505,6 +517,18 @@ const SELLERS_CATEGORIES = [
       "Cider",
       "Milk_Shakes",
       "Milk_Creams",
+      "Yogurt",
+      "Cheese",
+      "Butter",
+      "Cream_Cheese",
+      "Sour_Cream",
+      "Whipped_Cream",
+      "Cream",
+      "Milk",
+      "Ice_Cream",
+      "Frozen_Yogurt",
+      "Fura",
+      "Other",
     ],
   },
 
@@ -612,9 +636,10 @@ const SERVICE_PROVIDER_CATEGORIES = [
       "Painting",
       "Tiling",
       "Roofing",
-      "Generator_Repair",
       "Solar_Setup",
       "Pest_Control",
+      "Generator_Repair",
+      "Home_Automation",        // NEW
     ],
   },
   {
@@ -627,6 +652,7 @@ const SERVICE_PROVIDER_CATEGORIES = [
       "Sofa_Carpet_Cleaning",
       "Laundry_Dry_Cleaning",
       "Pool_Cleaning",
+      "Post_Construction_Cleaning", // NEW
     ],
   },
   {
@@ -634,16 +660,21 @@ const SERVICE_PROVIDER_CATEGORIES = [
     icon: "package",
     subcategories: [
       "Bike_Delivery",
+      "Motor_Park_Agents",      // NEW
+      "Airport_Pickup_Agents",  // NEW
+      "Logistics_Company",      // NEW
       "Moving_Relocation",
       "Truck_Haulage",
       "Private_Driver",
       "Airport_Pickup",
+      "Area_Errands",           // NEW
     ],
   },
   {
     name: "Real_Estate_Services",
     icon: "home",
     subcategories: [
+      "Real_Estate_Agent",       // NEW (already in Business_Professional but added here too)
       "Property_Sales_Leasing",
       "Facility_Management",
       "Land_Surveying",
@@ -685,11 +716,13 @@ const SERVICE_PROVIDER_CATEGORIES = [
       "Photographer",
       "Videographer",
       "Caterer",
+      "Ushers",                 // NEW
       "Cake_Baker",
       "Makeup_Artist",
       "Security_Bouncers",
       "Live_Band",
       "Ushering_Services",
+      "Event_Cleaning_Services", // NEW
     ],
   },
   {
@@ -705,6 +738,9 @@ const SERVICE_PROVIDER_CATEGORIES = [
       "Architecture",
       "Interior_Design",
       "Visa_Travel_Consultant",
+      "Business_Consulting",    // NEW
+      "Financial_Advising",     // NEW
+      "Project_Management",     // NEW
     ],
   },
   {
@@ -718,6 +754,12 @@ const SERVICE_PROVIDER_CATEGORIES = [
       "Language_Lessons",
       "Skill_Acquisition",
       "JAMB_WAEC_Lessons",
+      "NECO_Lessons",           // NEW
+      "Post_UTME_Lessons",      // NEW
+      "Common_Entrance_Lessons", // NEW
+      "Adult_Literacy_Lessons", // NEW
+      "Special_Needs_Education", // NEW
+      "Early_Childhood_Education", // NEW
     ],
   },
   {
@@ -730,6 +772,9 @@ const SERVICE_PROVIDER_CATEGORIES = [
       "Yoga_Instructor",
       "Nutritionist",
       "Physiotherapist",
+      "Mental_Health_Counselor", // NEW
+      "Occupational_Therapist",  // NEW
+      "Speech_Therapist",        // NEW
     ],
   },
   {
@@ -737,12 +782,16 @@ const SERVICE_PROVIDER_CATEGORIES = [
     icon: "scissors",
     subcategories: [
       "Tailoring",
+      "Fashion_Design",          // NEW
+      "Jewelry_Design",          // NEW
       "Barbering",
       "Hair_Styling",
       "Manicure_Pedicure",
-      "Tattoo_Piercing",
       "Nail_Technician",
       "Lashes_Brows",
+      "Makeup_Artist",           // NEW (was only in Events before)
+      "Beauty_Salon",            // NEW
+      "Spa_Services",            // NEW
     ],
   },
   {
@@ -750,10 +799,15 @@ const SERVICE_PROVIDER_CATEGORIES = [
     icon: "box",
     subcategories: [
       "Welding_Iron_Work",
+      "Wood_Work",               // NEW
+      "Metal_Work",              // NEW
+      "Plastic_Work",            // NEW
+      "Glass_Work",
+      "Ceramic_Work",            // NEW
+      "Metal_Fabrication",       // NEW
       "Bricklaying",
       "Aluminum_Work",
       "POP_Ceiling",
-      "Glass_Work",
       "Gate_Fence_Fabrication",
     ],
   },
