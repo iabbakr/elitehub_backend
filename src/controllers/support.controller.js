@@ -31,12 +31,14 @@ const upload  = multer({
   fileFilter: (req, file, cb) => {
     const allowed = [
       'image/jpeg', 'image/png', 'image/webp', 'image/gif',
-      'video/mp4', 'video/quicktime', 'video/webm',
+      'video/mp4', 'video/quicktime', 'video/webm', 'video/3gpp',
       'application/pdf', 'application/msword',
       'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      // React Native iOS sends this for .mp4/.mov — we detect real type by extension
+      'application/octet-stream',
     ];
     if (allowed.includes(file.mimetype)) cb(null, true);
-    else cb(new AppError('File type not allowed', 400));
+    else cb(new AppError(`File type not allowed: ${file.mimetype}`, 400));
   },
 });
 exports.uploadMiddleware = upload.single('file');
@@ -389,7 +391,22 @@ exports.sendMessage = catchAsync(async (req, res, next) => {
 exports.uploadMedia = catchAsync(async (req, res, next) => {
   if (!req.file) return next(new AppError('No file provided', 400));
 
-  const { mimetype, originalname, buffer } = req.file;
+  const { originalname, buffer } = req.file;
+  let { mimetype } = req.file;
+
+  // React Native iOS sometimes sends 'application/octet-stream' for .mp4 / .mov.
+  // Fall back to extension-based detection so Cloudinary gets the right resource_type.
+  if (!mimetype || mimetype === 'application/octet-stream') {
+    const ext = path.extname(originalname).toLowerCase();
+    const extMap = {
+      '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
+      '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+      '.gif': 'image/gif', '.webp': 'image/webp',
+      '.pdf': 'application/pdf',
+    };
+    mimetype = extMap[ext] || mimetype;
+  }
+
   const isImage    = mimetype.startsWith('image/');
   const isVideo    = mimetype.startsWith('video/');
   const resourceType = isImage ? 'image' : isVideo ? 'video' : 'raw';
