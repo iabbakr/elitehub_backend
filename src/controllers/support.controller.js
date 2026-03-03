@@ -19,7 +19,7 @@ const { db, admin } = require('../config/firebase');
 const { client: redis } = require('../config/redis');
 const catchAsync = require('../utils/catchAsync');
 const AppError   = require('../utils/AppError');
-const cloudinary = require('../config/cloudinary');   // require your configured cloudinary instance
+const cdnService = require('../services/cdn.service');  // ✅ CDNService — no raw cloudinary needed
 const multer     = require('multer');
 const path       = require('path');
 
@@ -98,10 +98,6 @@ async function sendPushNotification({ recipientUserId, title, body, data = {} })
 }
 
 // ── 1. POST /chats/init ──────────────────────────────────────────────────────
-/**
- * Initialize a new support chat session.
- * Guards against duplicate sessions via Redis.
- */
 exports.initChat = catchAsync(async (req, res, next) => {
   const { subject, initialMessage } = req.body;
   const userId = req.userId;
@@ -140,8 +136,8 @@ exports.initChat = catchAsync(async (req, res, next) => {
     queuePosition:   null,
   };
 
-  const batch     = db.batch();
-  const msgRef    = chatRef.collection('messages').doc();
+  const batch  = db.batch();
+  const msgRef = chatRef.collection('messages').doc();
 
   batch.set(chatRef, chatData);
   batch.set(msgRef, {
@@ -169,11 +165,6 @@ exports.initChat = catchAsync(async (req, res, next) => {
   res.status(201).json({ success: true, chatId, message: 'Support request queued' });
 });
 
-/**
- * Notify all online support agents of new waiting chat.
- * We query agents with role admin/support_agent who have an FCM token.
- * Capped at 10 to avoid fan-out overload on large teams.
- */
 async function _notifyAvailableAgents(userName, subject) {
   const snap = await db.collection('users')
     .where('role', 'in', ['admin', 'support_agent'])
@@ -207,17 +198,15 @@ exports.assignChat = catchAsync(async (req, res, next) => {
   }
 
   await chatRef.update({
-    status:            'active',
-    assignedAdminId:   adminId,
-    assignedAdminName: req.userProfile?.name || 'Agent',
+    status:              'active',
+    assignedAdminId:     adminId,
+    assignedAdminName:   req.userProfile?.name || 'Agent',
     assignedAdminAvatar: req.userProfile?.imageUrl || null,
-    updatedAt:         Date.now(),
+    updatedAt:           Date.now(),
   });
 
-  // Remove from Redis queue
   await redis.lRem('support_queue', 0, chatId);
 
-  // Push notification to user: their chat has been assigned
   await sendPushNotification({
     recipientUserId: chatData.userId,
     title: '✅ Support Agent Connected',
@@ -230,7 +219,7 @@ exports.assignChat = catchAsync(async (req, res, next) => {
 
 // ── 3. POST /chats/:chatId/resolve ───────────────────────────────────────────
 exports.resolveChat = catchAsync(async (req, res, next) => {
-  const { chatId }        = req.params;
+  const { chatId }                  = req.params;
   const { rating, feedback, notes } = req.body;
 
   const chatRef = db.collection('supportChats').doc(chatId);
@@ -242,15 +231,13 @@ exports.resolveChat = catchAsync(async (req, res, next) => {
     status:     'resolved',
     resolvedAt: Date.now(),
     updatedAt:  Date.now(),
-    rating:     rating  || null,
+    rating:     rating   || null,
     feedback:   feedback || null,
-    adminNotes: notes   || null,
+    adminNotes: notes    || null,
   });
 
-  // Clear Redis session lock so user can start a new chat
   await redis.del(`active_support_chat:${chatData.userId}`);
 
-  // Push to user: chat resolved — prompt rating
   await sendPushNotification({
     recipientUserId: chatData.userId,
     title: '🎉 Chat Resolved',
@@ -272,7 +259,6 @@ exports.getChatStatus = catchAsync(async (req, res) => {
   const queue    = await redis.lRange('support_queue', 0, -1);
   const position = queue.indexOf(chatId) + 1;
 
-  // Fetch latest chat doc for richer response
   let chatSnap;
   try {
     chatSnap = await db.collection('supportChats').doc(chatId).get();
@@ -281,37 +267,27 @@ exports.getChatStatus = catchAsync(async (req, res) => {
   const chatData = chatSnap?.data();
 
   res.json({
-    success:       true,
-    active:        true,
+    success:           true,
+    active:            true,
     chatId,
-    queuePosition: position > 0 ? position : 0,
-    status:        position > 0 ? 'waiting' : 'active',
+    queuePosition:     position > 0 ? position : 0,
+    status:            position > 0 ? 'waiting' : 'active',
     assignedAdminName: chatData?.assignedAdminName || null,
     subject:           chatData?.subject || null,
-    estimatedWaitTime: position > 0 ? Math.max(1, position * 3) : 0, // rough 3 min/position
+    estimatedWaitTime: position > 0 ? Math.max(1, position * 3) : 0,
   });
 });
 
 // ── 5. POST /chats/:chatId/message ───────────────────────────────────────────
-/**
- * Server-side message send with push notification.
- *
- * The client can also write directly to Firestore via supportChatService,
- * but this endpoint should be called when you need server-side push delivery.
- *
- * Best practice: call this from the mobile app INSTEAD of writing to Firestore
- * directly, so push is guaranteed even when the app is backgrounded.
- */
 exports.sendMessage = catchAsync(async (req, res, next) => {
-  const { chatId }     = req.params;
+  const { chatId }                              = req.params;
   const { message, messageType = 'text', attachments } = req.body;
-  const senderId       = req.userId;
+  const senderId                                = req.userId;
 
   if (!message?.trim() && (!attachments || attachments.length === 0)) {
     return next(new AppError('message or attachments required', 400));
   }
 
-  // Validate message type
   const validTypes = ['text', 'image', 'video', 'file'];
   if (!validTypes.includes(messageType)) {
     return next(new AppError(`messageType must be one of: ${validTypes.join(', ')}`, 400));
@@ -326,35 +302,32 @@ exports.sendMessage = catchAsync(async (req, res, next) => {
     return next(new AppError('Cannot send messages to a closed chat', 400));
   }
 
-  // Write message to Firestore subcollection
-  const msgRef = chatRef.collection('messages').doc();
+  const msgRef     = chatRef.collection('messages').doc();
   const senderRole = req.userProfile?.role || 'user';
   const isAdmin    = ['admin', 'support_agent'].includes(senderRole);
 
   const msgData = {
-    id:          msgRef.id,
+    id:           msgRef.id,
     chatId,
     senderId,
     senderRole,
-    senderName:  req.userProfile?.name || 'User',
+    senderName:   req.userProfile?.name || 'User',
     senderAvatar: req.userProfile?.imageUrl || null,
-    message:     message?.trim() || (messageType === 'text' ? '' : `Sent a ${messageType}`),
+    message:      message?.trim() || (messageType === 'text' ? '' : `Sent a ${messageType}`),
     messageType,
     attachments:  attachments || [],
     timestamp:    Date.now(),
     isRead:       false,
   };
 
-  // Batch: write message + update chat meta
   const batch = db.batch();
   batch.set(msgRef, msgData);
   batch.update(chatRef, {
-    lastMessage:      messageType === 'text'
+    lastMessage:     messageType === 'text'
       ? (message?.substring(0, 100) || '')
       : `📎 Sent a ${messageType}`,
-    lastMessageTime:  Date.now(),
-    totalMessages:    admin.firestore.FieldValue.increment(1),
-    // Increment the OTHER party's unread counter
+    lastMessageTime: Date.now(),
+    totalMessages:   admin.firestore.FieldValue.increment(1),
     ...(isAdmin
       ? { unreadCount: admin.firestore.FieldValue.increment(1) }
       : { adminUnreadCount: admin.firestore.FieldValue.increment(1) }
@@ -362,7 +335,6 @@ exports.sendMessage = catchAsync(async (req, res, next) => {
   });
   await batch.commit();
 
-  // Push to recipient (fire-and-forget)
   const recipientId = isAdmin ? chatData.userId : chatData.assignedAdminId;
   if (recipientId && recipientId !== senderId) {
     const senderName = req.userProfile?.name || (isAdmin ? 'Support' : 'User');
@@ -382,7 +354,7 @@ exports.sendMessage = catchAsync(async (req, res, next) => {
 
 // ── 6. POST /chats/upload-media ──────────────────────────────────────────────
 /**
- * Upload image / video / document to Cloudinary.
+ * Upload image / video / document to Cloudinary via CDNService.
  * Returns { success, url, publicId, resourceType, mimeType }
  *
  * Mount multer middleware in routes:
@@ -401,38 +373,27 @@ exports.uploadMedia = catchAsync(async (req, res, next) => {
     const extMap = {
       '.mp4': 'video/mp4', '.mov': 'video/quicktime', '.webm': 'video/webm',
       '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
-      '.gif': 'image/gif', '.webp': 'image/webp',
+      '.gif': 'image/gif',  '.webp': 'image/webp',
       '.pdf': 'application/pdf',
     };
     mimetype = extMap[ext] || mimetype;
   }
 
-  const isImage    = mimetype.startsWith('image/');
-  const isVideo    = mimetype.startsWith('video/');
+  const isImage      = mimetype.startsWith('image/');
+  const isVideo      = mimetype.startsWith('video/');
   const resourceType = isImage ? 'image' : isVideo ? 'video' : 'raw';
 
-  // Stream buffer to Cloudinary
-  const uploadResult = await new Promise((resolve, reject) => {
-    const stream = cloudinary.uploader.upload_stream(
-      {
-        resource_type: resourceType,
-        folder:        'support_chats',
-        public_id:     `${Date.now()}_${path.parse(originalname).name}`,
-        overwrite:     false,
-        // Auto-quality + auto-format for images
-        ...(isImage && { quality: 'auto', fetch_format: 'auto' }),
-        // Cap video bitrate to keep uploads reasonable
-        ...(isVideo && { video_codec: 'auto', bit_rate: '500k' }),
-      },
-      (error, result) => {
-        if (error) reject(error);
-        else resolve(result);
-      },
-    );
-    stream.end(buffer);
+  // ✅ Delegate to CDNService.uploadFile — single Cloudinary integration point
+  const result = await cdnService.uploadFile(buffer, {
+    folder:       'support_chats',
+    resourceType,                                          // CDNService maps this → resource_type
+    public_id:    `${Date.now()}_${path.parse(originalname).name}`,
+    overwrite:    false,
+    // Auto-quality + auto-format for images
+    ...(isImage && { quality: 'auto', fetch_format: 'auto' }),
+    // Cap video bitrate to keep uploads reasonable
+    ...(isVideo && { video_codec: 'auto', bit_rate: '500k' }),
   });
-
-  const result = uploadResult;
 
   res.status(200).json({
     success:      true,
@@ -459,10 +420,9 @@ exports.getMessages = catchAsync(async (req, res, next) => {
   const chatDoc = await chatRef.get();
   if (!chatDoc.exists) return next(new AppError('Chat not found', 404));
 
-  // Authorisation: user must be chat participant or admin/support_agent
-  const chatData  = chatDoc.data();
-  const isAgent   = ['admin', 'support_agent'].includes(req.userProfile?.role);
-  const isOwner   = chatData.userId === req.userId;
+  const chatData = chatDoc.data();
+  const isAgent  = ['admin', 'support_agent'].includes(req.userProfile?.role);
+  const isOwner  = chatData.userId === req.userId;
   if (!isAgent && !isOwner) return next(new AppError('Not authorised', 403));
 
   const snap = await chatRef.collection('messages')

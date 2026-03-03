@@ -188,29 +188,41 @@ router.post('/signup', catchAsync(async (req, res, next) => {
       isLocked: false,
     });
 
+    // 4. ✅ FIX: Create referral display record so /pending list works.
+    //    The `referrals` collection is what GET /referrals/pending queries.
+    //    Without this write, a referred user never appears in the referrer's list,
+    //    and the bonus can never be triggered.
+    if (referredBy) {
+      batch.set(db.collection('referrals').doc(`${referredBy}_${uid}`), {
+        referrerId: referredBy,
+        refereeId: uid,
+        refereeName: name.trim(),
+        createdAt: Date.now(),
+        released: false, // ← queried by /pending; set to true (then deleted) on bonus payout
+      });
+    }
+
     await batch.commit();
 
     // ✅ GENERATE CUSTOM TOKEN FOR AUTO-LOGIN
     const customToken = await auth.createCustomToken(uid);
 
     // ✅ SEND WELCOME EMAIL (Fire and forget)
-    // ✅ UPDATED ONBOARDING TRIGGER
-setImmediate(async () => {
-  try {
-    console.log(`Attempting to send welcome email to: ${email.trim()}`);
-    if (role === 'seller') {
-      await EmailService.sendSellerWelcomeEmail(email.trim(), name.trim());
-    } else if (role === 'service') {
-      await EmailService.sendServiceWelcomeEmail(email.trim(), name.trim());
-    } else {
-      await EmailService.sendBuyerWelcomeEmail(email.trim(), name.trim());
-    }
-    console.log(`✅ Welcome email process completed for ${email.trim()}`);
-  } catch (error) {
-    // This will now show up in your Render logs
-    console.error('❌ CRITICAL: Welcome email failed during signup:', error);
-  }
-});
+    setImmediate(async () => {
+      try {
+        console.log(`Attempting to send welcome email to: ${email.trim()}`);
+        if (role === 'seller') {
+          await EmailService.sendSellerWelcomeEmail(email.trim(), name.trim());
+        } else if (role === 'service') {
+          await EmailService.sendServiceWelcomeEmail(email.trim(), name.trim());
+        } else {
+          await EmailService.sendBuyerWelcomeEmail(email.trim(), name.trim());
+        }
+        console.log(`✅ Welcome email process completed for ${email.trim()}`);
+      } catch (error) {
+        console.error('❌ CRITICAL: Welcome email failed during signup:', error);
+      }
+    });
 
     // ✅ RESPONSE
     res.status(201).json({
