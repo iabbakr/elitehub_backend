@@ -8,10 +8,12 @@
  *  - Redis fast-path idempotency prevents double-payout under concurrent requests.
  *  - Firestore transaction makes wallet credit + flag + txn record 100% atomic.
  *  - Referral record is deleted ONLY after successful credit (clean-up on success).
- *  - /release is guarded by X-Internal-Secret — never exposed to the public internet.
+ *  - creditReferralBonus is now EXPORTED so order.controller can call it directly,
+ *    removing the fragile internal HTTP round-trip that caused bonuses to silently fail.
  *
  * Endpoints:
- *   POST /api/v1/referrals/release   — internal: called by order.controller after confirmDelivery
+ *   POST /api/v1/referrals/release   — internal: kept for backwards compat but order.controller
+ *                                      now calls creditReferralBonus() directly instead
  *   GET  /api/v1/referrals/pending   — paginated pending referral list for current user
  *   GET  /api/v1/referrals/stats     — totalEarned / successfulCount / pendingCount
  */
@@ -29,11 +31,14 @@ const REFERRAL_BONUS = 500; // ₦500
 const PAGE_SIZE      = 10;
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HELPER: Atomic referral bonus credit
+// CORE FUNCTION: Atomic referral bonus credit
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * creditReferralBonus
+ *
+ * ✅ EXPORTED — called directly by order.controller.confirmDelivery
+ *    to avoid the fragile internal HTTP round-trip that caused silent failures.
  *
  * Atomically:
  *   1. Marks referee's `hasCompletedFirstPurchase = true`
@@ -44,10 +49,16 @@ const PAGE_SIZE      = 10;
  *   6. Sets Redis lock (24 h) to block any future processing
  *
  * Returns { alreadyProcessed: true } if the payout was already done.
+ *
+ * @param {string} referrerId     - UID of the user who shared their code
+ * @param {string} refereeId      - UID of the user who used the code (the buyer)
+ * @param {string} refereeOrderId - The orderId that triggered this (for audit trail)
  */
 async function creditReferralBonus(referrerId, refereeId, refereeOrderId) {
   // ── Level 1: Redis fast-path idempotency ────────────────────────────────
-  const lockKey = `referral:bonus:${refereeId}`; // keyed on referee (the buyer)
+  // Keyed on referee so even if referrerId changes (shouldn't happen), we
+  // still catch double-processing attempts.
+  const lockKey = `referral:bonus:${refereeId}`;
   const already = await client.get(lockKey);
   if (already) return { alreadyProcessed: true };
 
@@ -82,7 +93,7 @@ async function creditReferralBonus(referrerId, refereeId, refereeOrderId) {
 
     const refereeData = refereeSnap.data();
 
-    // Security guard: validate referral ownership server-side
+    // Security guard: validate referral ownership server-side — never trust client input
     if (refereeData.referredBy !== referrerId) {
       throw Object.assign(new Error('REFERRAL_MISMATCH'), { code: 'REFERRAL_MISMATCH' });
     }
@@ -130,8 +141,9 @@ async function creditReferralBonus(referrerId, refereeId, refereeOrderId) {
       updatedAt: Date.now(),
     });
 
-    // 5. Delete the referral display record INSIDE the transaction
-    //    This ensures it's removed atomically — only on successful credit
+    // 5. Delete the referral display record INSIDE the transaction.
+    //    This is atomic — if any step above fails, this deletion is also rolled back.
+    //    After successful deletion the person no longer appears in /pending list.
     t.delete(referralDocRef);
   });
 
@@ -141,7 +153,7 @@ async function creditReferralBonus(referrerId, refereeId, refereeOrderId) {
   //    Firestore is slow to propagate the hasCompletedFirstPurchase flag
   await client.setEx(lockKey, 86_400, 'paid');
 
-  // 7. Bust referral caches for this referrer
+  // 7. Bust referral caches for this referrer so UI reflects changes immediately
   await Promise.allSettled([
     client.del(`referrals:stats:${referrerId}`),
     client.del(`referrals:pending:${referrerId}:first`),
@@ -153,7 +165,11 @@ async function creditReferralBonus(referrerId, refereeId, refereeOrderId) {
 // ─────────────────────────────────────────────────────────────────────────────
 // POST /api/v1/referrals/release
 //
-// Internal-only. Called by order.controller.confirmDelivery via setImmediate.
+// Internal-only endpoint — kept for backwards compatibility and manual admin
+// triggers. order.controller.confirmDelivery now calls creditReferralBonus()
+// directly instead of hitting this over HTTP, which was the root cause of
+// silent failures when API_BASE_URL or INTERNAL_SECRET env vars were not set.
+//
 // Body: { buyerId: string, orderId: string }
 // Header: X-Internal-Secret: <INTERNAL_SECRET>
 // ─────────────────────────────────────────────────────────────────────────────
@@ -243,7 +259,7 @@ router.get(
 
     // Query the `referrals` collection (display records) — not `users` directly.
     // This avoids a full users table scan and is much cheaper at scale.
-    // Each doc: { referrerId, refereeId, refereeName, createdAt }
+    // Each doc: { referrerId, refereeId, refereeName, createdAt, released }
     let q = db.collection('referrals')
       .where('referrerId', '==', referrerId)
       .where('released', '==', false)
@@ -254,8 +270,8 @@ router.get(
       q = q.startAfter(lastCreatedAt);
     }
 
-    const snap = await q.get();
-    const docs  = snap.docs.slice(0, PAGE_SIZE);
+    const snap    = await q.get();
+    const docs    = snap.docs.slice(0, PAGE_SIZE);
     const hasMore = snap.docs.length > PAGE_SIZE;
 
     const referrals = docs.map((d) => {
@@ -317,4 +333,20 @@ router.get(
   })
 );
 
+// ─────────────────────────────────────────────────────────────────────────────
+// EXPORTS
+// ─────────────────────────────────────────────────────────────────────────────
 module.exports = router;
+
+/**
+ * ✅ KEY CHANGE: creditReferralBonus is exported so order.controller.confirmDelivery
+ * can call it directly as a function instead of making an HTTP POST to /release.
+ *
+ * The old approach failed silently because:
+ *   - API_BASE_URL env var was missing/wrong → axios.post threw a connection error
+ *   - INTERNAL_SECRET env var was missing → internalOnly middleware returned 403
+ *   - Both errors were caught by the setImmediate try/catch and only console.error'd
+ *
+ * Direct function call eliminates all of that.
+ */
+module.exports.creditReferralBonus = creditReferralBonus;

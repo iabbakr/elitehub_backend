@@ -8,6 +8,11 @@ const AppError = require('../utils/AppError');
 const walletService = require('../services/wallet.service');
 const pushNotificationService = require('../services/push-notification.service');
 
+// ✅ FIX: Import creditReferralBonus directly — eliminates the fragile internal
+// HTTP round-trip that caused referral bonuses to silently fail when
+// API_BASE_URL or INTERNAL_SECRET env vars were not correctly set.
+const { creditReferralBonus } = require('../routes/referral.routes');
+
 const VALID_TRACKING_STATUSES = ['acknowledged', 'enroute', 'ready_for_pickup'];
 const PLATFORM_COMMISSION_RATE = 0.10;
 
@@ -62,20 +67,9 @@ async function invalidateOrderCaches(orderId, buyerId, sellerId) {
 }
 
 /**
- * Get tracking message
+ * Notify each unique seller after a successful bundle order.
+ * Called via setImmediate so a notification failure never blocks checkout.
  */
-function getTrackingMessage(status) {
-    const messages = {
-        acknowledged: 'Seller confirmed your order and is preparing items',
-        enroute: 'Your order is on the way!',
-        ready_for_pickup: 'Your order is ready for pickup/delivery confirmation'
-    };
-    return messages[status] || 'Order status updated';
-}
-
-// ── FIX: Notify each unique seller after a successful bundle order ────────────
-// Called via setImmediate AFTER the transaction commits so it's non-blocking
-// and a notification failure can never roll back a completed purchase.
 async function notifySellersAfterBundle(subOrders, orderIds) {
     const notifPromises = subOrders.map((subOrder, index) => {
         const orderId = orderIds[index];
@@ -119,7 +113,7 @@ exports.getOrders = catchAsync(async (req, res, next) => {
     const userId = req.userId;
     const cacheKey = `orders:${userId}:${role || 'all'}:${status || 'all'}`;
     const cached = await client.get(cacheKey);
-    
+
     if (cached) return res.json({ success: true, orders: JSON.parse(cached), cached: true });
 
     let query = db.collection('orders');
@@ -132,7 +126,10 @@ exports.getOrders = catchAsync(async (req, res, next) => {
             db.collection('orders').where('buyerId', '==', userId).get(),
             db.collection('orders').where('sellerId', '==', userId).get()
         ]);
-        let orders = [...buyerSnap.docs.map(d => ({id: d.id, ...d.data()})), ...sellerSnap.docs.map(d => ({id: d.id, ...d.data()}))];
+        let orders = [
+            ...buyerSnap.docs.map(d => ({ id: d.id, ...d.data() })),
+            ...sellerSnap.docs.map(d => ({ id: d.id, ...d.data() }))
+        ];
         orders = orders.filter((o, i, self) => i === self.findIndex(t => t.id === o.id));
         if (status) orders = orders.filter(o => o.status === status);
         orders.sort((a, b) => b.createdAt - a.createdAt);
@@ -151,7 +148,7 @@ exports.getOrder = catchAsync(async (req, res, next) => {
     const { orderId } = req.params;
     const cacheKey = `order_full:${orderId}`;
     const cached = await client.get(cacheKey);
-    
+
     if (cached) return res.status(200).json({ success: true, order: JSON.parse(cached), source: 'cache' });
 
     const orderDoc = await db.collection('orders').doc(orderId).get();
@@ -170,8 +167,16 @@ exports.getOrder = catchAsync(async (req, res, next) => {
 
     const richOrder = {
         ...orderData,
-        buyerDetails: buyerSnap.exists ? { name: buyerSnap.data().name, phone: buyerSnap.data().phone, imageUrl: buyerSnap.data().imageUrl } : null,
-        sellerDetails: sellerSnap.exists ? { businessName: sellerSnap.data().businessName || sellerSnap.data().name, businessAddress: sellerSnap.data().businessAddress, imageUrl: sellerSnap.data().imageUrl } : null
+        buyerDetails: buyerSnap.exists ? {
+            name: buyerSnap.data().name,
+            phone: buyerSnap.data().phone,
+            imageUrl: buyerSnap.data().imageUrl
+        } : null,
+        sellerDetails: sellerSnap.exists ? {
+            businessName: sellerSnap.data().businessName || sellerSnap.data().name,
+            businessAddress: sellerSnap.data().businessAddress,
+            imageUrl: sellerSnap.data().imageUrl
+        } : null
     };
 
     await client.setEx(cacheKey, 120, JSON.stringify(richOrder));
@@ -187,10 +192,10 @@ exports.getOrder = catchAsync(async (req, res, next) => {
  * Create single order with escrow lock
  */
 exports.createOrder = catchAsync(async (req, res, next) => {
-    const { 
-        products, 
-        deliveryAddress, 
-        phoneNumber, 
+    const {
+        products,
+        deliveryAddress,
+        phoneNumber,
         discount = 0,
         deliveryMethod = 'delivery',
         deliveryFee = 0,
@@ -217,9 +222,9 @@ exports.createOrder = catchAsync(async (req, res, next) => {
     const createLockKey = `order:create:${buyerId}:${Date.now()}`;
     const isCreating = await client.get(createLockKey);
     if (isCreating) {
-        return res.status(409).json({ 
-            success: false, 
-            message: 'Processing your previous order...' 
+        return res.status(409).json({
+            success: false,
+            message: 'Processing your previous order...'
         });
     }
     await client.setEx(createLockKey, 30, 'true');
@@ -231,7 +236,7 @@ exports.createOrder = catchAsync(async (req, res, next) => {
 
         for (const item of products) {
             const product = await getDocument('products', item.productId);
-            
+
             if (!product || product.sellerId !== sellerId) {
                 await client.del(createLockKey);
                 return next(new AppError('Invalid product selection', 400));
@@ -242,21 +247,21 @@ exports.createOrder = catchAsync(async (req, res, next) => {
                 return next(new AppError(`Insufficient stock for ${product.name}`, 400));
             }
 
-            const price = product.discount 
-                ? product.price * (1 - product.discount / 100) 
+            const price = product.discount
+                ? product.price * (1 - product.discount / 100)
                 : product.price;
-            
+
             subtotal += price * item.quantity;
-            
-            orderProducts.push({ 
-                ...item, 
-                productName: product.name, 
-                price 
+
+            orderProducts.push({
+                ...item,
+                productName: product.name,
+                price
             });
-            
-            productUpdates.push({ 
-                ref: db.collection('products').doc(product.id), 
-                newStock: product.stock - item.quantity 
+
+            productUpdates.push({
+                ref: db.collection('products').doc(product.id),
+                newStock: product.stock - item.quantity
             });
         }
 
@@ -303,10 +308,10 @@ exports.createOrder = catchAsync(async (req, res, next) => {
         });
 
         await walletService.processOrderPayment(
-            buyerId, 
-            sellerId, 
-            orderId, 
-            totalAmount, 
+            buyerId,
+            sellerId,
+            orderId,
+            totalAmount,
             commission
         );
 
@@ -322,8 +327,8 @@ exports.createOrder = catchAsync(async (req, res, next) => {
             invalidateOrderCaches(orderId, buyerId, sellerId)
         ]);
 
-        res.status(201).json({ 
-            success: true, 
+        res.status(201).json({
+            success: true,
             orderId,
             message: 'Order created successfully'
         });
@@ -374,17 +379,17 @@ exports.createBundleOrder = catchAsync(async (req, res, next) => {
 
         const buyerWalletRef = db.collection('wallets').doc(buyerId);
         const buyerWalletSnap = await transaction.get(buyerWalletRef);
-        
+
         if (!buyerWalletSnap.exists) {
             throw new AppError('Buyer wallet not found', 404);
         }
         const buyerWallet = buyerWalletSnap.data();
 
         const uniqueSellerIds = [...new Set(subOrders.map(so => so.sellerId))];
-        const sellerWalletRefs = uniqueSellerIds.map(sid => 
+        const sellerWalletRefs = uniqueSellerIds.map(sid =>
             db.collection('wallets').doc(sid)
         );
-        
+
         const sellerWalletSnaps = await Promise.all(
             sellerWalletRefs.map(ref => transaction.get(ref))
         );
@@ -409,7 +414,7 @@ exports.createBundleOrder = catchAsync(async (req, res, next) => {
 
             for (const item of subOrder.items) {
                 const product = productMap.get(item.productId);
-                
+
                 if (!product) {
                     throw new AppError(`Product ${item.productName} not found`, 404);
                 }
@@ -423,10 +428,10 @@ exports.createBundleOrder = catchAsync(async (req, res, next) => {
 
                 stockUpdates.set(item.productId, newRequested);
 
-                const price = product.discount 
-                    ? product.price * (1 - product.discount / 100) 
+                const price = product.discount
+                    ? product.price * (1 - product.discount / 100)
                     : product.price;
-                
+
                 subtotal += price * item.quantity;
             }
 
@@ -468,9 +473,6 @@ exports.createBundleOrder = catchAsync(async (req, res, next) => {
                 updatedAt: Date.now()
             });
 
-            // ✅ FIX [Bug 2]: Added `reference` to buyer transaction metadata.
-            // Previously this was missing, causing TransactionDetailScreen and
-            // TransactionReceiptScreen to display "Reference: N/A" for buyers.
             const buyerTxnRef = db.collection(`wallets/${buyerId}/transactions`).doc(`pay_${data.orderId}`);
             transaction.set(buyerTxnRef, {
                 id: `pay_${data.orderId}`,
@@ -483,7 +485,7 @@ exports.createBundleOrder = catchAsync(async (req, res, next) => {
                 timestamp: Date.now(),
                 metadata: {
                     orderId: data.orderId,
-                    reference: `pay_${data.orderId}` // ✅ FIX [Bug 2]: was missing
+                    reference: `pay_${data.orderId}`
                 }
             });
 
@@ -519,7 +521,7 @@ exports.createBundleOrder = catchAsync(async (req, res, next) => {
         stockUpdates.forEach((quantity, productId) => {
             const productRef = db.collection('products').doc(productId);
             const product = productMap.get(productId);
-            
+
             transaction.update(productRef, {
                 stock: product.stock - quantity,
                 updatedAt: Date.now()
@@ -527,9 +529,7 @@ exports.createBundleOrder = catchAsync(async (req, res, next) => {
         });
     });
 
-    // ── FIX: Notify sellers after transaction — non-blocking via setImmediate ──
-    // setImmediate ensures the response is sent first, so a slow/failed push
-    // notification never delays or breaks the buyer's checkout confirmation.
+    // Notify sellers after transaction — non-blocking via setImmediate
     setImmediate(() => {
         notifySellersAfterBundle(subOrders, orderIds).catch((err) =>
             console.error('[Bundle] Seller notification batch error:', err)
@@ -575,7 +575,7 @@ exports.updateTracking = catchAsync(async (req, res, next) => {
         const trackingOrder = ['acknowledged', 'enroute', 'ready_for_pickup'];
         const currentIndex = trackingOrder.indexOf(order.trackingStatus);
         const newIndex = trackingOrder.indexOf(status);
-        
+
         if (currentIndex >= newIndex && order.trackingStatus !== null) {
             await client.del(lockKey);
             return next(new AppError('Cannot move backwards in tracking', 400));
@@ -597,8 +597,8 @@ exports.updateTracking = catchAsync(async (req, res, next) => {
             order.buyerId,
             "📦 Order Update",
             statusMessages[status],
-            { 
-                screen: "OrderDetailScreen", 
+            {
+                screen: "OrderDetailScreen",
                 params: { orderId },
                 badge: 1
             }
@@ -609,8 +609,8 @@ exports.updateTracking = catchAsync(async (req, res, next) => {
             invalidateOrderCaches(orderId, order.buyerId, order.sellerId)
         ]);
 
-        res.json({ 
-            success: true, 
+        res.json({
+            success: true,
             message: `Order status updated to: ${status}`,
             newStatus: status
         });
@@ -644,8 +644,8 @@ exports.cancelOrderBuyer = catchAsync(async (req, res, next) => {
 
         if (order.trackingStatus) {
             await client.del(lockKey);
-            return res.status(403).json({ 
-                success: false, 
+            return res.status(403).json({
+                success: false,
                 message: 'ORDER_LOCKED: Seller has already confirmed this order. Please contact support if needed.',
                 locked: true
             });
@@ -689,8 +689,8 @@ exports.cancelOrderBuyer = catchAsync(async (req, res, next) => {
             invalidateOrderCaches(orderId, order.buyerId, order.sellerId)
         ]);
 
-        res.json({ 
-            success: true, 
+        res.json({
+            success: true,
             message: 'Order cancelled and refund processed',
             refundAmount: order.totalAmount
         });
@@ -745,8 +745,8 @@ exports.cancelOrderSeller = catchAsync(async (req, res, next) => {
                 transaction.update(sellerRef, {
                     autoCancelStrikes: admin.firestore.FieldValue.increment(1),
                     isSuspended: (sellerData.autoCancelStrikes || 0) + 1 >= 3,
-                    suspensionReason: (sellerData.autoCancelStrikes || 0) + 1 >= 3 
-                        ? 'Automated suspension: Multiple cancellations after order confirmation' 
+                    suspensionReason: (sellerData.autoCancelStrikes || 0) + 1 >= 3
+                        ? 'Automated suspension: Multiple cancellations after order confirmation'
                         : null
                 });
             }
@@ -773,8 +773,8 @@ exports.cancelOrderSeller = catchAsync(async (req, res, next) => {
             invalidateOrderCaches(orderId, order.buyerId, order.sellerId)
         ]);
 
-        res.json({ 
-            success: true, 
+        res.json({
+            success: true,
             message: 'Order cancelled and buyer refunded',
             warning: order.trackingStatus ? 'Strike recorded for late cancellation' : null
         });
@@ -789,8 +789,17 @@ exports.cancelOrderSeller = catchAsync(async (req, res, next) => {
  * PUT /api/v1/orders/:orderId/confirm-delivery
  *
  * Buyer confirms delivery → releases escrow to seller.
- * After escrow is confirmed, triggers referral bonus check fire-and-forget.
- * Referral failure is INTENTIONALLY non-fatal — delivery is already confirmed.
+ *
+ * ✅ FIX: Referral bonus is now processed by calling creditReferralBonus()
+ * directly as a function (imported from referral.routes.js) instead of making
+ * an internal HTTP POST to /api/v1/referrals/release.
+ *
+ * The old HTTP approach failed silently because:
+ *   - API_BASE_URL env var was missing/wrong → axios threw a connection error
+ *   - INTERNAL_SECRET env var missing/wrong → internalOnly middleware returned 403
+ *   - Both failure modes were caught by the setImmediate try/catch and only logged
+ *
+ * Referral failure is still INTENTIONALLY non-fatal — delivery is already confirmed.
  */
 exports.confirmDelivery = catchAsync(async (req, res, next) => {
     const { orderId } = req.params;
@@ -802,8 +811,8 @@ exports.confirmDelivery = catchAsync(async (req, res, next) => {
 
         if (order.status === 'delivered') {
             await client.del(lockKey);
-            return res.status(409).json({ 
-                success: false, 
+            return res.status(409).json({
+                success: false,
                 message: 'ORDER_ALREADY_DELIVERED: Payment has already been released',
                 alreadyProcessed: true
             });
@@ -837,32 +846,60 @@ exports.confirmDelivery = catchAsync(async (req, res, next) => {
             });
         }
 
-        // ── 2. 🎁 Referral bonus — fire-and-forget via internal HTTP call ──
-        // Using setImmediate ensures this runs AFTER the response is flushed.
-        // Any failure is caught and logged — never propagates to the buyer.
-        if (!releaseResult.alreadyProcessed) {
-            setImmediate(async () => {
-                try {
-                    const axios = require('axios');
-                    await axios.post(
-                        `${process.env.API_BASE_URL}/api/v1/referrals/release`,
-                        { buyerId: order.buyerId, orderId },
-                        {
-                            headers: {
-                                'X-Internal-Secret': process.env.INTERNAL_SECRET,
-                                'Content-Type': 'application/json',
-                            },
-                            timeout: 10_000,
-                        }
-                    );
-                } catch (err) {
-                    // Non-fatal — escrow is already released, buyer is confirmed.
-                    console.error(`[Referral] Auto-release failed for order ${orderId} (non-fatal):`, err.message);
-                }
-            });
-        }
+        // ── 2. 🎁 Referral bonus — fire-and-forget, non-fatal ───────────────
+        //
+        // ✅ FIX: Direct function call instead of internal HTTP POST.
+        //
+        // setImmediate ensures the HTTP response reaches the buyer before this
+        // runs. Any failure here is caught and logged but never returned to the user.
+        // The referrerId is always read from Firestore inside creditReferralBonus —
+        // reading it here first is only for the cheap fast-exit checks.
+        setImmediate(async () => {
+            try {
+                // Fetch buyer's profile to check if they were referred
+                const refereeSnap = await db.collection('users').doc(order.buyerId).get();
+                if (!refereeSnap.exists) return;
 
-        // ── 3. Notify seller ─────────────────────────────────────────────────
+                const refereeData = refereeSnap.data();
+
+                // Fast exits — avoids a Firestore transaction when not needed
+                if (!refereeData.referredBy) return;
+                if (refereeData.hasCompletedFirstPurchase) return;
+
+                // ✅ Direct function call — no HTTP, no env var dependency
+                const result = await creditReferralBonus(
+                    refereeData.referredBy,  // referrerId — read from Firestore, never from client
+                    order.buyerId,           // refereeId
+                    orderId                  // for audit trail / firstPurchaseOrderId
+                );
+
+                if (!result.alreadyProcessed) {
+                    // Push notification to referrer — fire-and-forget, never blocks
+                    pushNotificationService.sendPushToUser(
+                        refereeData.referredBy,
+                        '🎉 Referral Bonus Earned!',
+                        `₦500 has been added to your wallet!`,
+                        { screen: 'ProfileTab', params: { screen: 'AccountInfo' }, type: 'referral_bonus' }
+                    ).catch(err => {
+                        console.warn('[Referral] Push notification failed (non-fatal):', err.message);
+                    });
+
+                    console.log(
+                        `✅ [Referral] ₦500 released → referrer: ${refereeData.referredBy} | buyer: ${order.buyerId} | order: ${orderId}`
+                    );
+                }
+            } catch (err) {
+                // ALREADY_PROCESSED and REFERRAL_MISMATCH are expected/benign — don't clutter logs
+                if (err.code !== 'ALREADY_PROCESSED' && err.code !== 'REFERRAL_MISMATCH') {
+                    console.error(
+                        `[Referral] Unexpected failure for order ${orderId} (non-fatal):`,
+                        err.message
+                    );
+                }
+            }
+        });
+
+        // ── 3. Notify seller of payment release ─────────────────────────────
         await pushNotificationService.sendPushToUser(
             order.sellerId,
             "💸 Payment Released",
@@ -876,8 +913,8 @@ exports.confirmDelivery = catchAsync(async (req, res, next) => {
             invalidateOrderCaches(orderId, order.buyerId, order.sellerId)
         ]);
 
-        res.json({ 
-            success: true, 
+        res.json({
+            success: true,
             message: 'Delivery confirmed and payment released to seller',
             sellerAmount: order.totalAmount - order.commission
         });
@@ -901,7 +938,7 @@ exports.getAutomationStats = catchAsync(async (req, res, next) => {
         .orderBy('updatedAt', 'desc')
         .limit(20)
         .get();
-    
+
     const lastHeartbeat = await client.get('system:keepalive');
 
     res.json({
@@ -921,14 +958,14 @@ exports.getFlaggedSellers = catchAsync(async (req, res, next) => {
     const snapshot = await db.collection('users')
         .where('autoCancelStrikes', '>', 0)
         .get();
-    
-    const sellers = snapshot.docs.map(doc => ({ 
-        uid: doc.id, 
-        name: doc.data().name, 
-        strikes: doc.data().autoCancelStrikes, 
-        isSuspended: doc.data().isSuspended || false 
+
+    const sellers = snapshot.docs.map(doc => ({
+        uid: doc.id,
+        name: doc.data().name,
+        strikes: doc.data().autoCancelStrikes,
+        isSuspended: doc.data().isSuspended || false
     }));
-    
+
     res.json({ success: true, sellers });
 });
 
@@ -937,22 +974,22 @@ exports.getFlaggedSellers = catchAsync(async (req, res, next) => {
  */
 exports.pardonSeller = catchAsync(async (req, res, next) => {
     const { userId } = req.params;
-    
-    await db.collection('users').doc(userId).update({ 
-        autoCancelStrikes: 0, 
-        isSuspended: false, 
-        suspensionReason: null, 
-        updatedAt: Date.now() 
+
+    await db.collection('users').doc(userId).update({
+        autoCancelStrikes: 0,
+        isSuspended: false,
+        suspensionReason: null,
+        updatedAt: Date.now()
     });
-    
+
     await client.del(`user:${userId}:profile`);
-    
+
     await pushNotificationService.sendPushToUser(
-        userId, 
-        "Shop Reinstated", 
+        userId,
+        "Shop Reinstated",
         "Your account is healthy again."
     );
-    
+
     res.json({ success: true, message: "Seller pardoned" });
 });
 
@@ -961,9 +998,9 @@ exports.pardonSeller = catchAsync(async (req, res, next) => {
  */
 exports.toggleMaintenance = catchAsync(async (req, res, next) => {
     const { enabled } = req.body;
-    
+
     await client.set('system:maintenance_mode', enabled ? 'true' : 'false');
-    
+
     console.log(`🔧 Maintenance mode ${enabled ? 'ENABLED' : 'DISABLED'}`);
 
     res.json({ success: true, enabled });
