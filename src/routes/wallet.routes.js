@@ -14,12 +14,13 @@
 // ✅ Redis idempotency — duplicate requests are no-ops
 // ✅ Paystack transfer initiated after wallet is successfully debited
 // ✅ Auto-refund on Paystack transfer failure
+// ✅ FIX: Redis user profile cache is now invalidated after bank details are saved
 
 const express         = require('express');
 const router          = express.Router();
 const { db, admin }   = require('../config/firebase');
 const { client }      = require('../config/redis');
-const { CACHE_TTL }   = require('../config/redis');
+const { CACHE_TTL, invalidateUserCache }   = require('../config/redis'); // ✅ FIX: import invalidateUserCache
 const paystackService = require('../services/paystack.service');
 const walletService   = require('../services/wallet.service');
 const pushNotificationService = require('../services/push-notification.service');
@@ -127,10 +128,10 @@ router.post(
 );
 
 // ─── POST /api/v1/wallet/add-bank-details ────────────────────────────────────
-
-// ─── POST /api/v1/wallet/add-bank-details ────────────────────────────────────
-// ✅ FIXED: Now saves bankName to bankAccount document so withdrawal route
-// can read it for the transaction description + receipts.
+// ✅ FIX: Now calls invalidateUserCache(userId) after saving so the authenticate
+// middleware's Redis cache is cleared. Without this, the withdrawal route reads
+// the stale cached userProfile (missing paystackRecipientCode) for up to 5 min
+// and incorrectly rejects the withdrawal with "Please link a bank account".
 
 router.post(
   '/add-bank-details',
@@ -138,7 +139,7 @@ router.post(
   userRateLimit(3, 15 * 60 * 1000),
   async (req, res) => {
     try {
-      const { accountNumber, bankCode, accountName, bankName } = req.body; // ✅ Accept bankName
+      const { accountNumber, bankCode, accountName, bankName } = req.body;
       const userId = req.userId;
 
       if (!accountNumber || !bankCode) {
@@ -167,7 +168,7 @@ router.post(
         return res.status(500).json({ success: false, message: 'Failed to create transfer recipient. Please try again.' });
       }
 
-      // 3. Save to Firestore — including bankName ✅
+      // 3. Save to Firestore — including bankName
       const { updateDocument } = require('../config/firebase');
       await updateDocument('users', userId, {
         paystackRecipientCode: recipient.recipientCode,
@@ -175,11 +176,24 @@ router.post(
           accountName: verification.accountName,
           accountNumber,
           bankCode,
-          bankName: bankName || '',          // ✅ Save the bank name
+          bankName: bankName || '',
           verified: true,
           addedAt: Date.now(),
         },
       });
+
+      // ✅ FIX: Bust the Redis user-profile cache so the withdrawal route
+      // immediately sees the new paystackRecipientCode on next request.
+      // Without this, the stale cached profile (no recipientCode) is served
+      // for up to CACHE_TTL.SHORT (5 min) and the withdrawal is incorrectly
+      // rejected with "Please link a verified bank account before withdrawing."
+      try {
+        await invalidateUserCache(userId);
+        console.log(`✅ Redis profile cache cleared for ${userId} after bank details update`);
+      } catch (cacheErr) {
+        // Non-fatal — log and continue. The cache TTL will expire on its own.
+        console.warn(`⚠️ Could not invalidate Redis cache for ${userId}:`, cacheErr.message);
+      }
 
       console.log(`✅ Bank details saved for ${userId}: ${recipient.recipientCode}`);
 
@@ -469,8 +483,14 @@ router.post(
       }
 
       // ── 4. Verified bank account required ──────────────────────────────
-      const recipientCode = userProfile?.paystackRecipientCode;
-      const bankAccount   = userProfile?.bankAccount;
+      // ✅ FIX: Read directly from Firestore instead of relying on the cached
+      // req.userProfile. This ensures we always see the latest bank details
+      // even if the Redis cache hasn't expired yet.
+      const { getDocument } = require('../config/firebase');
+      const freshUserProfile = await getDocument('users', userId);
+
+      const recipientCode = freshUserProfile?.paystackRecipientCode;
+      const bankAccount   = freshUserProfile?.bankAccount;
 
       if (!recipientCode || !bankAccount?.verified) {
         return res.status(400).json({
@@ -481,7 +501,7 @@ router.post(
       }
 
       // ── 5. Daily limit check ────────────────────────────────────────────
-      const dailyLimit = getDailyLimit(userProfile?.role);
+      const dailyLimit = getDailyLimit(freshUserProfile?.role ?? userProfile?.role);
       const usedToday  = await getDailyWithdrawalTotal(userId);
 
       if (usedToday + amountNaira > dailyLimit) {
