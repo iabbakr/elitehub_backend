@@ -15,7 +15,6 @@ const SELLERS_CATEGORIES = [
       "Feature_Phones",
       "Refurbished_Phones",
       "Tablets",
-      "SIM_Cards",
       "Phone_Cases",
       "Screen_Protectors",
       "Phone_Stands",
