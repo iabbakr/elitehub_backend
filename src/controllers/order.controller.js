@@ -8,53 +8,36 @@ const AppError = require('../utils/AppError');
 const walletService = require('../services/wallet.service');
 const pushNotificationService = require('../services/push-notification.service');
 
-// ✅ FIX: Import creditReferralBonus directly — eliminates the fragile internal
-// HTTP round-trip that caused referral bonuses to silently fail when
-// API_BASE_URL or INTERNAL_SECRET env vars were not correctly set.
 const { creditReferralBonus } = require('../routes/referral.routes');
 
 const VALID_TRACKING_STATUSES = ['acknowledged', 'enroute', 'ready_for_pickup'];
-const PLATFORM_COMMISSION_RATE = 0.10;
+
+// ✅ CHANGED from 0.10 → 0.05  (5% platform commission)
+const PLATFORM_COMMISSION_RATE = 0.05;
 
 // ==========================================
 // HELPER FUNCTIONS
 // ==========================================
 
-/**
- * Get fresh order data with Redis lock
- */
 async function getFreshOrderWithLock(orderId, lockKey, lockTTL = 30) {
     const isLocked = await client.get(lockKey);
     if (isLocked) {
         throw new AppError('ACTION_IN_PROGRESS: Another operation is processing this order. Please wait.', 409);
     }
-
     await client.setEx(lockKey, lockTTL, 'processing');
-
     const order = await getDocument('orders', orderId);
     if (!order) {
         await client.del(lockKey);
         throw new AppError('ORDER_NOT_FOUND', 404);
     }
-
     return order;
 }
 
-/**
- * Validate user authorization
- */
 function validateOrderAccess(order, userId, requiredRole) {
-    if (requiredRole === 'buyer' && order.buyerId !== userId) {
-        throw new AppError('UNAUTHORIZED: You are not the buyer of this order', 403);
-    }
-    if (requiredRole === 'seller' && order.sellerId !== userId) {
-        throw new AppError('UNAUTHORIZED: You are not the seller of this order', 403);
-    }
+    if (requiredRole === 'buyer'  && order.buyerId  !== userId) throw new AppError('UNAUTHORIZED: You are not the buyer of this order',  403);
+    if (requiredRole === 'seller' && order.sellerId !== userId) throw new AppError('UNAUTHORIZED: You are not the seller of this order', 403);
 }
 
-/**
- * Invalidate all caches for an order
- */
 async function invalidateOrderCaches(orderId, buyerId, sellerId) {
     await Promise.all([
         client.del(`order:${orderId}`),
@@ -66,41 +49,22 @@ async function invalidateOrderCaches(orderId, buyerId, sellerId) {
     ]);
 }
 
-/**
- * Notify each unique seller after a successful bundle order.
- * Called via setImmediate so a notification failure never blocks checkout.
- */
 async function notifySellersAfterBundle(subOrders, orderIds) {
     const notifPromises = subOrders.map((subOrder, index) => {
         const orderId = orderIds[index];
         if (!orderId || !subOrder.sellerId) return Promise.resolve();
-
-        const itemTotal = subOrder.items.reduce(
-            (sum, item) => sum + item.price * item.quantity,
-            0
-        );
-        const orderTotal = Math.round(
-            itemTotal - (subOrder.discount || 0) + (subOrder.deliveryFee || 0)
-        );
-        const shortId = orderId.slice(-6).toUpperCase();
-
+        const itemTotal  = subOrder.items.reduce((sum, item) => sum + item.price * item.quantity, 0);
+        const orderTotal = Math.round(itemTotal - (subOrder.discount || 0) + (subOrder.deliveryFee || 0));
+        const shortId    = orderId.slice(-6).toUpperCase();
         return pushNotificationService
             .sendOrderAlert(
-                subOrder.sellerId,
-                'order_new',
-                orderId,
+                subOrder.sellerId, 'order_new', orderId,
                 '🎉 New Order Received!',
                 `Order #${shortId} • ₦${orderTotal.toLocaleString('en-NG')} — tap to confirm`,
                 { requiresAction: true }
             )
-            .catch((err) =>
-                console.error(
-                    `[Bundle] Seller notify failed for ${subOrder.sellerId}:`,
-                    err.message
-                )
-            );
+            .catch(err => console.error(`[Bundle] Seller notify failed for ${subOrder.sellerId}:`, err.message));
     });
-
     await Promise.allSettled(notifPromises);
 }
 
@@ -110,10 +74,9 @@ async function notifySellersAfterBundle(subOrders, orderIds) {
 
 exports.getOrders = catchAsync(async (req, res, next) => {
     const { status, role } = req.query;
-    const userId = req.userId;
+    const userId   = req.userId;
     const cacheKey = `orders:${userId}:${role || 'all'}:${status || 'all'}`;
-    const cached = await client.get(cacheKey);
-
+    const cached   = await client.get(cacheKey);
     if (cached) return res.json({ success: true, orders: JSON.parse(cached), cached: true });
 
     let query = db.collection('orders');
@@ -123,11 +86,11 @@ exports.getOrders = catchAsync(async (req, res, next) => {
         query = query.where('sellerId', '==', userId);
     } else {
         const [buyerSnap, sellerSnap] = await Promise.all([
-            db.collection('orders').where('buyerId', '==', userId).get(),
+            db.collection('orders').where('buyerId',  '==', userId).get(),
             db.collection('orders').where('sellerId', '==', userId).get()
         ]);
         let orders = [
-            ...buyerSnap.docs.map(d => ({ id: d.id, ...d.data() })),
+            ...buyerSnap.docs.map(d  => ({ id: d.id,  ...d.data()  })),
             ...sellerSnap.docs.map(d => ({ id: d.id, ...d.data() }))
         ];
         orders = orders.filter((o, i, self) => i === self.findIndex(t => t.id === o.id));
@@ -139,23 +102,22 @@ exports.getOrders = catchAsync(async (req, res, next) => {
 
     if (status) query = query.where('status', '==', status);
     const snapshot = await query.orderBy('createdAt', 'desc').get();
-    const orders = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    const orders   = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
     await client.setEx(cacheKey, 60, JSON.stringify(orders));
     res.json({ success: true, orders });
 });
 
 exports.getOrder = catchAsync(async (req, res, next) => {
     const { orderId } = req.params;
-    const cacheKey = `order_full:${orderId}`;
-    const cached = await client.get(cacheKey);
-
+    const cacheKey    = `order_full:${orderId}`;
+    const cached      = await client.get(cacheKey);
     if (cached) return res.status(200).json({ success: true, order: JSON.parse(cached), source: 'cache' });
 
     const orderDoc = await db.collection('orders').doc(orderId).get();
     if (!orderDoc.exists) return next(new AppError('Order not found', 404));
 
     const orderData = { id: orderDoc.id, ...orderDoc.data() };
-    const isStaff = ['admin', 'support_agent'].includes(req.user?.role);
+    const isStaff   = ['admin', 'support_agent'].includes(req.user?.role);
     if (orderData.buyerId !== req.userId && orderData.sellerId !== req.userId && !isStaff) {
         return next(new AppError('Unauthorized access', 403));
     }
@@ -167,16 +129,8 @@ exports.getOrder = catchAsync(async (req, res, next) => {
 
     const richOrder = {
         ...orderData,
-        buyerDetails: buyerSnap.exists ? {
-            name: buyerSnap.data().name,
-            phone: buyerSnap.data().phone,
-            imageUrl: buyerSnap.data().imageUrl
-        } : null,
-        sellerDetails: sellerSnap.exists ? {
-            businessName: sellerSnap.data().businessName || sellerSnap.data().name,
-            businessAddress: sellerSnap.data().businessAddress,
-            imageUrl: sellerSnap.data().imageUrl
-        } : null
+        buyerDetails:  buyerSnap.exists  ? { name: buyerSnap.data().name,  phone: buyerSnap.data().phone,  imageUrl: buyerSnap.data().imageUrl  } : null,
+        sellerDetails: sellerSnap.exists ? { businessName: sellerSnap.data().businessName || sellerSnap.data().name, businessAddress: sellerSnap.data().businessAddress, imageUrl: sellerSnap.data().imageUrl } : null
     };
 
     await client.setEx(cacheKey, 120, JSON.stringify(richOrder));
@@ -187,46 +141,25 @@ exports.getOrder = catchAsync(async (req, res, next) => {
 // 2. CREATE ORDER
 // ==========================================
 
-/**
- * POST /api/v1/orders
- * Create single order with escrow lock
- */
 exports.createOrder = catchAsync(async (req, res, next) => {
     const {
-        products,
-        deliveryAddress,
-        phoneNumber,
-        discount = 0,
-        deliveryMethod = 'delivery',
-        deliveryFee = 0,
-        buyerNote = ''
+        products, deliveryAddress, phoneNumber,
+        discount = 0, deliveryMethod = 'delivery', deliveryFee = 0, buyerNote = ''
     } = req.body;
     const buyerId = req.userId;
 
-    if (!products?.length || !deliveryAddress) {
-        return next(new AppError('Missing required fields', 400));
-    }
+    if (!products?.length || !deliveryAddress) return next(new AppError('Missing required fields', 400));
 
     const firstProduct = await getDocument('products', products[0].productId);
-    if (!firstProduct) {
-        return next(new AppError('Product not found', 404));
-    }
+    if (!firstProduct) return next(new AppError('Product not found', 404));
 
-    const sellerId = firstProduct.sellerId;
-
-    const sellerDoc = await getDocument('users', sellerId);
-    if (sellerDoc?.isSuspended) {
-        return next(new AppError('This shop is currently inactive.', 403));
-    }
+    const sellerId   = firstProduct.sellerId;
+    const sellerDoc  = await getDocument('users', sellerId);
+    if (sellerDoc?.isSuspended) return next(new AppError('This shop is currently inactive.', 403));
 
     const createLockKey = `order:create:${buyerId}:${Date.now()}`;
-    const isCreating = await client.get(createLockKey);
-    if (isCreating) {
-        return res.status(409).json({
-            success: false,
-            message: 'Processing your previous order...'
-        });
-    }
+    const isCreating    = await client.get(createLockKey);
+    if (isCreating) return res.status(409).json({ success: false, message: 'Processing your previous order...' });
     await client.setEx(createLockKey, 30, 'true');
 
     try {
@@ -236,37 +169,23 @@ exports.createOrder = catchAsync(async (req, res, next) => {
 
         for (const item of products) {
             const product = await getDocument('products', item.productId);
-
             if (!product || product.sellerId !== sellerId) {
                 await client.del(createLockKey);
                 return next(new AppError('Invalid product selection', 400));
             }
-
             if (product.stock < item.quantity) {
                 await client.del(createLockKey);
                 return next(new AppError(`Insufficient stock for ${product.name}`, 400));
             }
-
-            const price = product.discount
-                ? product.price * (1 - product.discount / 100)
-                : product.price;
-
+            const price = product.discount ? product.price * (1 - product.discount / 100) : product.price;
             subtotal += price * item.quantity;
-
-            orderProducts.push({
-                ...item,
-                productName: product.name,
-                price
-            });
-
-            productUpdates.push({
-                ref: db.collection('products').doc(product.id),
-                newStock: product.stock - item.quantity
-            });
+            orderProducts.push({ ...item, productName: product.name, price });
+            productUpdates.push({ ref: db.collection('products').doc(product.id), newStock: product.stock - item.quantity });
         }
 
         const totalAmount = Math.round(subtotal - discount + deliveryFee);
-        const commission = Math.round(totalAmount * PLATFORM_COMMISSION_RATE);
+        // ✅ 5% commission
+        const commission  = Math.round(totalAmount * PLATFORM_COMMISSION_RATE);
 
         const buyerBalance = await walletService.getBalance(buyerId);
         if (buyerBalance < totalAmount) {
@@ -278,60 +197,30 @@ exports.createOrder = catchAsync(async (req, res, next) => {
         await db.runTransaction(async (transaction) => {
             const orderRef = db.collection('orders').doc();
             orderId = orderRef.id;
-
             transaction.set(orderRef, {
-                id: orderId,
-                buyerId,
-                sellerId,
-                products: orderProducts,
-                totalAmount,
-                commission,
-                status: 'running',
-                deliveryAddress,
-                phoneNumber: phoneNumber || null,
-                deliveryMethod,
-                deliveryFee,
-                buyerNote: buyerNote || null,
-                disputeStatus: 'none',
-                trackingStatus: null,
-                createdAt: Date.now(),
-                updatedAt: Date.now(),
+                id: orderId, buyerId, sellerId, products: orderProducts,
+                totalAmount, commission, status: 'running',
+                deliveryAddress, phoneNumber: phoneNumber || null, deliveryMethod,
+                deliveryFee, buyerNote: buyerNote || null, disputeStatus: 'none',
+                trackingStatus: null, createdAt: Date.now(), updatedAt: Date.now()
             });
-
             for (const update of productUpdates) {
-                if (update.newStock <= 0) {
-                    transaction.delete(update.ref);
-                } else {
-                    transaction.update(update.ref, { stock: update.newStock });
-                }
+                if (update.newStock <= 0) transaction.delete(update.ref);
+                else transaction.update(update.ref, { stock: update.newStock });
             }
         });
 
-        await walletService.processOrderPayment(
-            buyerId,
-            sellerId,
-            orderId,
-            totalAmount,
-            commission
-        );
+        await walletService.processOrderPayment(buyerId, sellerId, orderId, totalAmount, commission);
 
         await pushNotificationService.sendPushToUser(
-            sellerId,
-            "New Order Received! 🎉",
+            sellerId, "New Order Received! 🎉",
             `Order #${orderId.slice(-6).toUpperCase()} worth ₦${totalAmount.toLocaleString()}`,
             { screen: "OrdersTab", params: { screen: "Orders" } }
         );
 
-        await Promise.all([
-            client.del(createLockKey),
-            invalidateOrderCaches(orderId, buyerId, sellerId)
-        ]);
+        await Promise.all([client.del(createLockKey), invalidateOrderCaches(orderId, buyerId, sellerId)]);
 
-        res.status(201).json({
-            success: true,
-            orderId,
-            message: 'Order created successfully'
-        });
+        res.status(201).json({ success: true, orderId, message: 'Order created successfully' });
 
     } catch (error) {
         await client.del(createLockKey);
@@ -339,10 +228,6 @@ exports.createOrder = catchAsync(async (req, res, next) => {
     }
 });
 
-/**
- * POST /api/v1/orders/bundle
- * Create multiple orders from cart atomically
- */
 exports.createBundleOrder = catchAsync(async (req, res, next) => {
     const { subOrders, phoneNumber } = req.body;
     const buyerId = req.userId;
@@ -355,150 +240,86 @@ exports.createBundleOrder = catchAsync(async (req, res, next) => {
     let totalCartAmount = 0;
 
     await db.runTransaction(async (transaction) => {
-        // PHASE 1: READ ALL DATA FIRST
         const allProductRefs = [];
         for (const subOrder of subOrders) {
             for (const item of subOrder.items) {
-                if (!item.productId) {
-                    throw new AppError(`Invalid data: Product ID is missing for ${item.productName}`, 400);
-                }
+                if (!item.productId) throw new AppError(`Invalid data: Product ID is missing for ${item.productName}`, 400);
                 allProductRefs.push(db.collection('products').doc(item.productId));
             }
         }
 
-        const productSnaps = await Promise.all(
-            allProductRefs.map(ref => transaction.get(ref))
-        );
+        const productSnaps = await Promise.all(allProductRefs.map(ref => transaction.get(ref)));
+        const productMap   = new Map();
+        productSnaps.forEach(snap => { if (snap.exists) productMap.set(snap.id, snap.data()); });
 
-        const productMap = new Map();
-        productSnaps.forEach(snap => {
-            if (snap.exists) {
-                productMap.set(snap.id, snap.data());
-            }
-        });
-
-        const buyerWalletRef = db.collection('wallets').doc(buyerId);
+        const buyerWalletRef  = db.collection('wallets').doc(buyerId);
         const buyerWalletSnap = await transaction.get(buyerWalletRef);
-
-        if (!buyerWalletSnap.exists) {
-            throw new AppError('Buyer wallet not found', 404);
-        }
+        if (!buyerWalletSnap.exists) throw new AppError('Buyer wallet not found', 404);
         const buyerWallet = buyerWalletSnap.data();
 
-        const uniqueSellerIds = [...new Set(subOrders.map(so => so.sellerId))];
-        const sellerWalletRefs = uniqueSellerIds.map(sid =>
-            db.collection('wallets').doc(sid)
-        );
+        const uniqueSellerIds   = [...new Set(subOrders.map(so => so.sellerId))];
+        const sellerWalletRefs  = uniqueSellerIds.map(sid => db.collection('wallets').doc(sid));
+        const sellerWalletSnaps = await Promise.all(sellerWalletRefs.map(ref => transaction.get(ref)));
+        const sellerWalletMap   = new Map();
+        sellerWalletSnaps.forEach(snap => { if (snap.exists) sellerWalletMap.set(snap.id, snap.data()); });
 
-        const sellerWalletSnaps = await Promise.all(
-            sellerWalletRefs.map(ref => transaction.get(ref))
-        );
-
-        const sellerWalletMap = new Map();
-        sellerWalletSnaps.forEach(snap => {
-            if (snap.exists) {
-                sellerWalletMap.set(snap.id, snap.data());
-            }
-        });
-
-        // PHASE 2: VALIDATE & PREPARE
         const stockUpdates = new Map();
-        const orderData = [];
+        const orderData    = [];
 
         for (const subOrder of subOrders) {
             const newOrderRef = db.collection('orders').doc();
-            const orderId = newOrderRef.id;
+            const orderId     = newOrderRef.id;
             orderIds.push(orderId);
 
             let subtotal = 0;
-
             for (const item of subOrder.items) {
-                const product = productMap.get(item.productId);
-
-                if (!product) {
-                    throw new AppError(`Product ${item.productName} not found`, 404);
-                }
-
-                const currentRequested = stockUpdates.get(item.productId) || 0;
-                const newRequested = currentRequested + item.quantity;
-
-                if (product.stock < newRequested) {
-                    throw new AppError(`Insufficient stock for ${product.name}`, 400);
-                }
-
-                stockUpdates.set(item.productId, newRequested);
-
-                const price = product.discount
-                    ? product.price * (1 - product.discount / 100)
-                    : product.price;
-
+                const product        = productMap.get(item.productId);
+                if (!product) throw new AppError(`Product ${item.productName} not found`, 404);
+                const currentReq     = stockUpdates.get(item.productId) || 0;
+                const newReq         = currentReq + item.quantity;
+                if (product.stock < newReq) throw new AppError(`Insufficient stock for ${product.name}`, 400);
+                stockUpdates.set(item.productId, newReq);
+                const price = product.discount ? product.price * (1 - product.discount / 100) : product.price;
                 subtotal += price * item.quantity;
             }
 
-            const orderTotal = Math.round(subtotal - subOrder.discount + subOrder.deliveryFee);
+            const orderTotal      = Math.round(subtotal - subOrder.discount + subOrder.deliveryFee);
+            // ✅ 5% commission
             const orderCommission = Math.round(orderTotal * PLATFORM_COMMISSION_RATE);
-            totalCartAmount += orderTotal;
+            totalCartAmount      += orderTotal;
 
-            orderData.push({
-                orderRef: newOrderRef,
-                orderId,
-                sellerId: subOrder.sellerId,
-                orderTotal,
-                orderCommission,
-                subOrder
-            });
+            orderData.push({ orderRef: newOrderRef, orderId, sellerId: subOrder.sellerId, orderTotal, orderCommission, subOrder });
         }
 
-        if (buyerWallet.balance < totalCartAmount) {
-            throw new AppError('Insufficient balance', 400);
-        }
+        if (buyerWallet.balance < totalCartAmount) throw new AppError('Insufficient balance', 400);
 
-        // PHASE 3: EXECUTE ALL WRITES
         for (const data of orderData) {
             transaction.set(data.orderRef, {
-                id: data.orderId,
-                buyerId,
-                sellerId: data.sellerId,
-                products: data.subOrder.items,
-                totalAmount: data.orderTotal,
-                commission: data.orderCommission,
-                status: 'running',
+                id: data.orderId, buyerId, sellerId: data.sellerId,
+                products: data.subOrder.items, totalAmount: data.orderTotal,
+                commission: data.orderCommission, status: 'running',
                 deliveryMethod: data.subOrder.deliveryMethod,
                 deliveryFee: data.subOrder.deliveryFee,
                 deliveryAddress: data.subOrder.deliveryAddress,
-                phoneNumber: phoneNumber || null,
-                buyerNote: data.subOrder.buyerNote || null,
-                disputeStatus: 'none',
-                createdAt: Date.now(),
-                updatedAt: Date.now()
+                phoneNumber: phoneNumber || null, buyerNote: data.subOrder.buyerNote || null,
+                disputeStatus: 'none', createdAt: Date.now(), updatedAt: Date.now()
             });
 
             const buyerTxnRef = db.collection(`wallets/${buyerId}/transactions`).doc(`pay_${data.orderId}`);
             transaction.set(buyerTxnRef, {
-                id: `pay_${data.orderId}`,
-                userId: buyerId,
-                type: 'debit',
-                category: 'order_payment',
-                amount: data.orderTotal,
+                id: `pay_${data.orderId}`, userId: buyerId, type: 'debit',
+                category: 'order_payment', amount: data.orderTotal,
                 description: `Order #${data.orderId.slice(-6).toUpperCase()} - Escrow Hold`,
-                status: 'pending',
-                timestamp: Date.now(),
-                metadata: {
-                    orderId: data.orderId,
-                    reference: `pay_${data.orderId}`
-                }
+                status: 'pending', timestamp: Date.now(),
+                metadata: { orderId: data.orderId, reference: `pay_${data.orderId}` }
             });
 
             const sellerTxnRef = db.collection(`wallets/${data.sellerId}/transactions`).doc();
             transaction.set(sellerTxnRef, {
-                id: sellerTxnRef.id,
-                userId: data.sellerId,
-                type: 'credit',
-                category: 'order_payment',
-                amount: data.orderTotal - data.orderCommission,
+                id: sellerTxnRef.id, userId: data.sellerId, type: 'credit',
+                category: 'order_payment', amount: data.orderTotal - data.orderCommission,
                 description: `Order #${data.orderId.slice(-6).toUpperCase()} - Pending Delivery`,
-                status: 'pending',
-                timestamp: Date.now(),
+                status: 'pending', timestamp: Date.now(),
                 metadata: { orderId: data.orderId, commission: data.orderCommission }
             });
 
@@ -513,36 +334,27 @@ exports.createBundleOrder = catchAsync(async (req, res, next) => {
         }
 
         transaction.update(buyerWalletRef, {
-            balance: buyerWallet.balance - totalCartAmount,
+            balance:        buyerWallet.balance - totalCartAmount,
             pendingBalance: (buyerWallet.pendingBalance || 0) + totalCartAmount,
-            updatedAt: Date.now()
+            updatedAt:      Date.now()
         });
 
         stockUpdates.forEach((quantity, productId) => {
             const productRef = db.collection('products').doc(productId);
-            const product = productMap.get(productId);
-
-            transaction.update(productRef, {
-                stock: product.stock - quantity,
-                updatedAt: Date.now()
-            });
+            const product    = productMap.get(productId);
+            transaction.update(productRef, { stock: product.stock - quantity, updatedAt: Date.now() });
         });
     });
 
-    // Notify sellers after transaction — non-blocking via setImmediate
     setImmediate(() => {
-        notifySellersAfterBundle(subOrders, orderIds).catch((err) =>
+        notifySellersAfterBundle(subOrders, orderIds).catch(err =>
             console.error('[Bundle] Seller notification batch error:', err)
         );
     });
 
     res.json({
-        success: true,
-        message: 'Bundle order created successfully',
-        orderIds,
-        totalAmount: totalCartAmount,
-        orderCount: orderIds.length,
-        timestamp: Date.now()
+        success: true, message: 'Bundle order created successfully',
+        orderIds, totalAmount: totalCartAmount, orderCount: orderIds.length, timestamp: Date.now()
     });
 });
 
@@ -550,18 +362,12 @@ exports.createBundleOrder = catchAsync(async (req, res, next) => {
 // 3. SELLER ACTIONS
 // ==========================================
 
-/**
- * PUT /api/v1/orders/:orderId/tracking
- * Seller updates tracking status
- */
 exports.updateTracking = catchAsync(async (req, res, next) => {
-    const { status } = req.body;
+    const { status }  = req.body;
     const { orderId } = req.params;
-    const lockKey = `order:tracking:${orderId}`;
+    const lockKey     = `order:tracking:${orderId}`;
 
-    if (!VALID_TRACKING_STATUSES.includes(status)) {
-        return next(new AppError('Invalid tracking status', 400));
-    }
+    if (!VALID_TRACKING_STATUSES.includes(status)) return next(new AppError('Invalid tracking status', 400));
 
     try {
         const order = await getFreshOrderWithLock(orderId, lockKey);
@@ -573,48 +379,30 @@ exports.updateTracking = catchAsync(async (req, res, next) => {
         }
 
         const trackingOrder = ['acknowledged', 'enroute', 'ready_for_pickup'];
-        const currentIndex = trackingOrder.indexOf(order.trackingStatus);
-        const newIndex = trackingOrder.indexOf(status);
-
+        const currentIndex  = trackingOrder.indexOf(order.trackingStatus);
+        const newIndex      = trackingOrder.indexOf(status);
         if (currentIndex >= newIndex && order.trackingStatus !== null) {
             await client.del(lockKey);
             return next(new AppError('Cannot move backwards in tracking', 400));
         }
 
         await db.collection('orders').doc(orderId).update({
-            trackingStatus: status,
-            updatedAt: Date.now(),
+            trackingStatus: status, updatedAt: Date.now(),
             [`tracking_${status}_at`]: Date.now()
         });
 
         const statusMessages = {
-            acknowledged: 'Seller confirmed your order and is preparing items',
-            enroute: 'Your order is on the way!',
-            ready_for_pickup: 'Your order is ready for pickup/delivery confirmation'
+            acknowledged:    'Seller confirmed your order and is preparing items',
+            enroute:         'Your order is on the way!',
+            ready_for_pickup:'Your order is ready for pickup/delivery confirmation'
         };
 
-        await pushNotificationService.sendPushToUser(
-            order.buyerId,
-            "📦 Order Update",
-            statusMessages[status],
-            {
-                screen: "OrderDetailScreen",
-                params: { orderId },
-                badge: 1
-            }
-        );
+        await pushNotificationService.sendPushToUser(order.buyerId, "📦 Order Update", statusMessages[status],
+            { screen: "OrderDetailScreen", params: { orderId }, badge: 1 });
 
-        await Promise.all([
-            client.del(lockKey),
-            invalidateOrderCaches(orderId, order.buyerId, order.sellerId)
-        ]);
+        await Promise.all([client.del(lockKey), invalidateOrderCaches(orderId, order.buyerId, order.sellerId)]);
 
-        res.json({
-            success: true,
-            message: `Order status updated to: ${status}`,
-            newStatus: status
-        });
-
+        res.json({ success: true, message: `Order status updated to: ${status}`, newStatus: status });
     } catch (error) {
         await client.del(lockKey);
         throw error;
@@ -625,18 +413,12 @@ exports.updateTracking = catchAsync(async (req, res, next) => {
 // 4. BUYER ACTIONS
 // ==========================================
 
-/**
- * PUT /api/v1/orders/:orderId/cancel-buyer
- * Buyer cancels order (only before seller acknowledgment)
- */
 exports.cancelOrderBuyer = catchAsync(async (req, res, next) => {
     const { orderId } = req.params;
-    const { reason } = req.body;
-    const lockKey = `order:cancel:buyer:${orderId}`;
+    const { reason }  = req.body;
+    const lockKey     = `order:cancel:buyer:${orderId}`;
 
-    if (!reason || reason.trim().length < 10) {
-        return next(new AppError('Cancellation reason must be at least 10 characters', 400));
-    }
+    if (!reason || reason.trim().length < 10) return next(new AppError('Cancellation reason must be at least 10 characters', 400));
 
     try {
         const order = await getFreshOrderWithLock(orderId, lockKey);
@@ -644,13 +426,8 @@ exports.cancelOrderBuyer = catchAsync(async (req, res, next) => {
 
         if (order.trackingStatus) {
             await client.del(lockKey);
-            return res.status(403).json({
-                success: false,
-                message: 'ORDER_LOCKED: Seller has already confirmed this order. Please contact support if needed.',
-                locked: true
-            });
+            return res.status(403).json({ success: false, message: 'ORDER_LOCKED: Seller has already confirmed this order.', locked: true });
         }
-
         if (order.status !== 'running') {
             await client.del(lockKey);
             return next(new AppError(`Cannot cancel ${order.status} orders`, 400));
@@ -659,60 +436,32 @@ exports.cancelOrderBuyer = catchAsync(async (req, res, next) => {
         await db.runTransaction(async (transaction) => {
             const orderRef = db.collection('orders').doc(orderId);
             transaction.update(orderRef, {
-                status: 'cancelled',
-                cancelReason: reason.trim(),
-                cancelledBy: req.userId,
-                cancelledByRole: 'buyer',
-                cancelledAt: Date.now(),
-                updatedAt: Date.now()
+                status: 'cancelled', cancelReason: reason.trim(),
+                cancelledBy: req.userId, cancelledByRole: 'buyer',
+                cancelledAt: Date.now(), updatedAt: Date.now()
             });
         });
 
-        await walletService.refundEscrow(
-            orderId,
-            order.buyerId,
-            order.sellerId,
-            order.totalAmount,
-            order.commission,
-            `Buyer cancelled: ${reason.trim()}`
-        );
+        await walletService.refundEscrow(orderId, order.buyerId, order.sellerId, order.totalAmount, order.commission, `Buyer cancelled: ${reason.trim()}`);
 
-        await pushNotificationService.sendPushToUser(
-            order.sellerId,
-            "Order Cancelled by Buyer",
-            `Order #${orderId.slice(-6)} was cancelled before confirmation`,
-            { screen: "OrdersTab" }
-        );
+        await pushNotificationService.sendPushToUser(order.sellerId, "Order Cancelled by Buyer",
+            `Order #${orderId.slice(-6)} was cancelled before confirmation`, { screen: "OrdersTab" });
 
-        await Promise.all([
-            client.del(lockKey),
-            invalidateOrderCaches(orderId, order.buyerId, order.sellerId)
-        ]);
+        await Promise.all([client.del(lockKey), invalidateOrderCaches(orderId, order.buyerId, order.sellerId)]);
 
-        res.json({
-            success: true,
-            message: 'Order cancelled and refund processed',
-            refundAmount: order.totalAmount
-        });
-
+        res.json({ success: true, message: 'Order cancelled and refund processed', refundAmount: order.totalAmount });
     } catch (error) {
         await client.del(lockKey);
         throw error;
     }
 });
 
-/**
- * PUT /api/v1/orders/:orderId/cancel-seller
- * Seller cancels order (anytime, incurs strikes)
- */
 exports.cancelOrderSeller = catchAsync(async (req, res, next) => {
     const { orderId } = req.params;
-    const { reason } = req.body;
-    const lockKey = `order:cancel:seller:${orderId}`;
+    const { reason }  = req.body;
+    const lockKey     = `order:cancel:seller:${orderId}`;
 
-    if (!reason || reason.trim().length < 10) {
-        return next(new AppError('Cancellation reason must be at least 10 characters', 400));
-    }
+    if (!reason || reason.trim().length < 10) return next(new AppError('Cancellation reason must be at least 10 characters', 400));
 
     try {
         const order = await getFreshOrderWithLock(orderId, lockKey);
@@ -724,86 +473,44 @@ exports.cancelOrderSeller = catchAsync(async (req, res, next) => {
         }
 
         await db.runTransaction(async (transaction) => {
-            const orderRef = db.collection('orders').doc(orderId);
+            const orderRef  = db.collection('orders').doc(orderId);
             const sellerRef = db.collection('users').doc(order.sellerId);
-
             const sellerSnap = await transaction.get(sellerRef);
             const sellerData = sellerSnap.data() || {};
 
             transaction.update(orderRef, {
-                status: 'cancelled',
-                sellerCancelled: true,
-                cancelReason: reason.trim(),
-                cancelledBy: req.userId,
-                cancelledByRole: 'seller',
-                cancelledAt: Date.now(),
-                updatedAt: Date.now()
+                status: 'cancelled', sellerCancelled: true, cancelReason: reason.trim(),
+                cancelledBy: req.userId, cancelledByRole: 'seller',
+                cancelledAt: Date.now(), updatedAt: Date.now()
             });
 
-            // ⚠️ Auto-strike only if order was already acknowledged
             if (order.trackingStatus) {
                 transaction.update(sellerRef, {
                     autoCancelStrikes: admin.firestore.FieldValue.increment(1),
                     isSuspended: (sellerData.autoCancelStrikes || 0) + 1 >= 3,
                     suspensionReason: (sellerData.autoCancelStrikes || 0) + 1 >= 3
-                        ? 'Automated suspension: Multiple cancellations after order confirmation'
-                        : null
+                        ? 'Automated suspension: Multiple cancellations after order confirmation' : null
                 });
             }
         });
 
-        await walletService.refundEscrow(
-            orderId,
-            order.buyerId,
-            order.sellerId,
-            order.totalAmount,
-            order.commission,
-            `Seller cancelled: ${reason.trim()}`
-        );
+        await walletService.refundEscrow(orderId, order.buyerId, order.sellerId, order.totalAmount, order.commission, `Seller cancelled: ${reason.trim()}`);
 
-        await pushNotificationService.sendPushToUser(
-            order.buyerId,
-            "Order Cancelled by Seller",
-            "Full refund has been credited to your wallet",
-            { screen: "OrdersTab" }
-        );
+        await pushNotificationService.sendPushToUser(order.buyerId, "Order Cancelled by Seller",
+            "Full refund has been credited to your wallet", { screen: "OrdersTab" });
 
-        await Promise.all([
-            client.del(lockKey),
-            invalidateOrderCaches(orderId, order.buyerId, order.sellerId)
-        ]);
+        await Promise.all([client.del(lockKey), invalidateOrderCaches(orderId, order.buyerId, order.sellerId)]);
 
-        res.json({
-            success: true,
-            message: 'Order cancelled and buyer refunded',
-            warning: order.trackingStatus ? 'Strike recorded for late cancellation' : null
-        });
-
+        res.json({ success: true, message: 'Order cancelled and buyer refunded', warning: order.trackingStatus ? 'Strike recorded for late cancellation' : null });
     } catch (error) {
         await client.del(lockKey);
         throw error;
     }
 });
 
-/**
- * PUT /api/v1/orders/:orderId/confirm-delivery
- *
- * Buyer confirms delivery → releases escrow to seller.
- *
- * ✅ FIX: Referral bonus is now processed by calling creditReferralBonus()
- * directly as a function (imported from referral.routes.js) instead of making
- * an internal HTTP POST to /api/v1/referrals/release.
- *
- * The old HTTP approach failed silently because:
- *   - API_BASE_URL env var was missing/wrong → axios threw a connection error
- *   - INTERNAL_SECRET env var missing/wrong → internalOnly middleware returned 403
- *   - Both failure modes were caught by the setImmediate try/catch and only logged
- *
- * Referral failure is still INTENTIONALLY non-fatal — delivery is already confirmed.
- */
 exports.confirmDelivery = catchAsync(async (req, res, next) => {
     const { orderId } = req.params;
-    const lockKey = `order:confirm:${orderId}`;
+    const lockKey     = `order:confirm:${orderId}`;
 
     try {
         const order = await getFreshOrderWithLock(orderId, lockKey);
@@ -811,114 +518,58 @@ exports.confirmDelivery = catchAsync(async (req, res, next) => {
 
         if (order.status === 'delivered') {
             await client.del(lockKey);
-            return res.status(409).json({
-                success: false,
-                message: 'ORDER_ALREADY_DELIVERED: Payment has already been released',
-                alreadyProcessed: true
-            });
+            return res.status(409).json({ success: false, message: 'ORDER_ALREADY_DELIVERED', alreadyProcessed: true });
         }
-
         if (order.status !== 'running') {
             await client.del(lockKey);
             return next(new AppError(`Cannot confirm ${order.status} orders`, 400));
         }
-
         if (order.trackingStatus !== 'ready_for_pickup') {
             await client.del(lockKey);
             return next(new AppError('Order must be marked as delivered by seller first', 400));
         }
 
-        // ── 1. Release escrow (atomic + idempotent) ─────────────────────────
         const releaseResult = await walletService.releaseEscrow(
-            orderId,
-            order.buyerId,
-            order.sellerId,
-            order.totalAmount,
-            order.commission
+            orderId, order.buyerId, order.sellerId, order.totalAmount, order.commission
         );
 
         if (releaseResult.alreadyProcessed) {
             await client.del(lockKey);
-            return res.json({
-                success: true,
-                message: 'Payment was already released',
-                alreadyProcessed: true
-            });
+            return res.json({ success: true, message: 'Payment was already released', alreadyProcessed: true });
         }
 
-        // ── 2. 🎁 Referral bonus — fire-and-forget, non-fatal ───────────────
-        //
-        // ✅ FIX: Direct function call instead of internal HTTP POST.
-        //
-        // setImmediate ensures the HTTP response reaches the buyer before this
-        // runs. Any failure here is caught and logged but never returned to the user.
-        // The referrerId is always read from Firestore inside creditReferralBonus —
-        // reading it here first is only for the cheap fast-exit checks.
+        // Referral bonus — fire-and-forget, non-fatal
         setImmediate(async () => {
             try {
-                // Fetch buyer's profile to check if they were referred
                 const refereeSnap = await db.collection('users').doc(order.buyerId).get();
                 if (!refereeSnap.exists) return;
-
                 const refereeData = refereeSnap.data();
-
-                // Fast exits — avoids a Firestore transaction when not needed
-                if (!refereeData.referredBy) return;
-                if (refereeData.hasCompletedFirstPurchase) return;
-
-                // ✅ Direct function call — no HTTP, no env var dependency
-                const result = await creditReferralBonus(
-                    refereeData.referredBy,  // referrerId — read from Firestore, never from client
-                    order.buyerId,           // refereeId
-                    orderId                  // for audit trail / firstPurchaseOrderId
-                );
-
+                if (!refereeData.referredBy || refereeData.hasCompletedFirstPurchase) return;
+                const result = await creditReferralBonus(refereeData.referredBy, order.buyerId, orderId);
                 if (!result.alreadyProcessed) {
-                    // Push notification to referrer — fire-and-forget, never blocks
                     pushNotificationService.sendPushToUser(
-                        refereeData.referredBy,
-                        '🎉 Referral Bonus Earned!',
+                        refereeData.referredBy, '🎉 Referral Bonus Earned!',
                         `₦500 has been added to your wallet!`,
                         { screen: 'ProfileTab', params: { screen: 'AccountInfo' }, type: 'referral_bonus' }
-                    ).catch(err => {
-                        console.warn('[Referral] Push notification failed (non-fatal):', err.message);
-                    });
-
-                    console.log(
-                        `✅ [Referral] ₦500 released → referrer: ${refereeData.referredBy} | buyer: ${order.buyerId} | order: ${orderId}`
-                    );
+                    ).catch(err => console.warn('[Referral] Push notification failed:', err.message));
                 }
             } catch (err) {
-                // ALREADY_PROCESSED and REFERRAL_MISMATCH are expected/benign — don't clutter logs
                 if (err.code !== 'ALREADY_PROCESSED' && err.code !== 'REFERRAL_MISMATCH') {
-                    console.error(
-                        `[Referral] Unexpected failure for order ${orderId} (non-fatal):`,
-                        err.message
-                    );
+                    console.error(`[Referral] Unexpected failure for order ${orderId}:`, err.message);
                 }
             }
         });
 
-        // ── 3. Notify seller of payment release ─────────────────────────────
-        await pushNotificationService.sendPushToUser(
-            order.sellerId,
-            "💸 Payment Released",
-            `₦${(order.totalAmount - order.commission).toLocaleString()} credited to your wallet`,
-            { screen: "OrdersTab" }
-        );
+        await pushNotificationService.sendPushToUser(order.sellerId, "💸 Payment Released",
+            `₦${(order.totalAmount - order.commission).toLocaleString()} credited to your wallet`, { screen: "OrdersTab" });
 
-        // ── 4. Cleanup ────────────────────────────────────────────────────────
-        await Promise.all([
-            client.del(lockKey),
-            invalidateOrderCaches(orderId, order.buyerId, order.sellerId)
-        ]);
+        await Promise.all([client.del(lockKey), invalidateOrderCaches(orderId, order.buyerId, order.sellerId)]);
 
         res.json({
             success: true,
             message: 'Delivery confirmed and payment released to seller',
             sellerAmount: order.totalAmount - order.commission
         });
-
     } catch (error) {
         await client.del(lockKey);
         throw error;
@@ -929,79 +580,39 @@ exports.confirmDelivery = catchAsync(async (req, res, next) => {
 // 5. ADMIN ROUTES
 // ==========================================
 
-/**
- * GET /api/v1/orders/admin/automation-stats
- */
 exports.getAutomationStats = catchAsync(async (req, res, next) => {
     const cancelledSnapshot = await db.collection('orders')
-        .where('autoCancelled', '==', true)
-        .orderBy('updatedAt', 'desc')
-        .limit(20)
-        .get();
-
+        .where('autoCancelled', '==', true).orderBy('updatedAt', 'desc').limit(20).get();
     const lastHeartbeat = await client.get('system:keepalive');
-
-    res.json({
-        success: true,
-        data: {
-            totalAutoCancelledCount: cancelledSnapshot.size,
-            lastSystemPulse: lastHeartbeat,
-            status: lastHeartbeat ? "Active" : "Inactive"
-        }
-    });
+    res.json({ success: true, data: {
+        totalAutoCancelledCount: cancelledSnapshot.size,
+        lastSystemPulse: lastHeartbeat,
+        status: lastHeartbeat ? "Active" : "Inactive"
+    }});
 });
 
-/**
- * GET /api/v1/orders/admin/flagged-sellers
- */
 exports.getFlaggedSellers = catchAsync(async (req, res, next) => {
-    const snapshot = await db.collection('users')
-        .where('autoCancelStrikes', '>', 0)
-        .get();
-
-    const sellers = snapshot.docs.map(doc => ({
-        uid: doc.id,
-        name: doc.data().name,
-        strikes: doc.data().autoCancelStrikes,
-        isSuspended: doc.data().isSuspended || false
+    const snapshot = await db.collection('users').where('autoCancelStrikes', '>', 0).get();
+    const sellers  = snapshot.docs.map(doc => ({
+        uid: doc.id, name: doc.data().name,
+        strikes: doc.data().autoCancelStrikes, isSuspended: doc.data().isSuspended || false
     }));
-
     res.json({ success: true, sellers });
 });
 
-/**
- * POST /api/v1/orders/admin/pardon-seller/:userId
- */
 exports.pardonSeller = catchAsync(async (req, res, next) => {
     const { userId } = req.params;
-
     await db.collection('users').doc(userId).update({
-        autoCancelStrikes: 0,
-        isSuspended: false,
-        suspensionReason: null,
-        updatedAt: Date.now()
+        autoCancelStrikes: 0, isSuspended: false, suspensionReason: null, updatedAt: Date.now()
     });
-
     await client.del(`user:${userId}:profile`);
-
-    await pushNotificationService.sendPushToUser(
-        userId,
-        "Shop Reinstated",
-        "Your account is healthy again."
-    );
-
+    await pushNotificationService.sendPushToUser(userId, "Shop Reinstated", "Your account is healthy again.");
     res.json({ success: true, message: "Seller pardoned" });
 });
 
-/**
- * POST /api/v1/orders/admin/system/maintenance
- */
 exports.toggleMaintenance = catchAsync(async (req, res, next) => {
     const { enabled } = req.body;
-
     await client.set('system:maintenance_mode', enabled ? 'true' : 'false');
-
     console.log(`🔧 Maintenance mode ${enabled ? 'ENABLED' : 'DISABLED'}`);
-
     res.json({ success: true, enabled });
 });

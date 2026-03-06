@@ -1,8 +1,19 @@
+'use strict';
+
+// ─── wallet.service.js ────────────────────────────────────────────────────────
+// ✅ FIXED: releaseEscrow now credits admin wallet with platform commission
+// ✅ FIXED: Commission rate changed to 5% (was 10%)
+// ✅ Commission split: 5% total → tracked in admin wallet as platform earnings
+// ✅ Admin wallet doc: wallets/admin — created automatically if missing
+
 const { db, admin } = require('../config/firebase');
 const { client } = require('../config/redis');
 const emailService = require('./email.service');
 const paystackService = require('./paystack.service');
 const pushNotificationService = require('./push-notification.service');
+
+// ─── Platform commission rate ─────────────────────────────────────────────────
+const PLATFORM_COMMISSION_RATE = 0.05; // ✅ CHANGED from 0.10 → 0.05
 
 class WalletService {
     async _verifyWalletStatus(userId) {
@@ -39,6 +50,29 @@ class WalletService {
             console.error('❌ Ensure wallet exists error:', error);
             throw new Error('Failed to ensure wallet exists');
         }
+    }
+
+    /**
+     * Ensure the admin wallet document exists.
+     * Called once during server startup is optional — this lazily creates it
+     * on the first commission credit if it doesn't exist.
+     */
+    async ensureAdminWalletExists(transaction) {
+        const adminRef = db.collection('wallets').doc('admin');
+        const adminSnap = await transaction.get(adminRef);
+        if (!adminSnap.exists) {
+            transaction.set(adminRef, {
+                userId: 'admin',
+                balance: 0,
+                pendingBalance: 0,
+                isLocked: false,
+                currency: 'NGN',
+                createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                version: 1
+            });
+        }
+        return adminRef;
     }
 
     async creditWallet(userId, amount, reference, metadata = {}) {
@@ -152,177 +186,6 @@ class WalletService {
         }
     }
 
-    async initializeWithdrawal(userId, userEmail, userName, payload) {
-        const { amountKobo, accountNumber, bankCode, accountName } = payload;
-        const amountNaira = amountKobo / 100;
-        const reference = `wd_${Date.now()}_${userId.slice(0, 5)}`;
-        const lockKey = `withdraw:lock:${reference}`;
-
-        try {
-            await this._verifyWalletStatus(userId);
-
-            const result = await db.runTransaction(async (transaction) => {
-                const walletRef = db.collection('wallets').doc(userId);
-                const userRef   = db.collection('users').doc(userId);
-                const txnRef    = db.collection('transactions').doc(`txn_${reference}`);
-
-                const [walletSnap, userSnap] = await Promise.all([
-                    transaction.get(walletRef),
-                    transaction.get(userRef)
-                ]);
-
-                if (!walletSnap.exists) throw new Error('Wallet not found');
-                const wallet = walletSnap.data();
-
-                if (wallet.balance < amountNaira) {
-                    throw new Error('Insufficient balance');
-                }
-
-                const userData = userSnap.data();
-                if (!userData.paystackRecipientCode) {
-                    throw new Error('Bank recipient not found. Please link your bank account again.');
-                }
-
-                transaction.set(txnRef, {
-                    id: reference,
-                    userId,
-                    type: 'debit',
-                    amount: amountNaira,
-                    description: `Withdrawal to ${accountName} (${bankCode})`,
-                    status: 'processing',
-                    timestamp: Date.now(),
-                    metadata: {
-                        withdrawal: true,
-                        accountNumber,
-                        bankCode,
-                        accountName,
-                        reference
-                    }
-                });
-
-                transaction.update(walletRef, {
-                    balance: admin.firestore.FieldValue.increment(-amountNaira),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                return { recipientCode: userData.paystackRecipientCode };
-            });
-
-            const transfer = await paystackService.initiateTransfer(
-                result.recipientCode,
-                amountNaira,
-                `EliteHub Payout: ${reference}`
-            );
-
-            await client.setEx(lockKey, 86400, 'true');
-            await this.invalidateWalletCache(userId);
-
-            try {
-                await emailService.sendWithdrawalConfirmation(userEmail, userName, amountNaira, {
-                    accountName,
-                    bankName: 'Verified Bank',
-                    accountNumber
-                });
-            } catch (err) {
-                console.warn('📧 Notification failed but withdrawal succeeded:', err.message);
-            }
-
-            return {
-                success: true,
-                reference: transfer.reference,
-                amount: amountNaira
-            };
-
-        } catch (error) {
-            console.error(`❌ Withdrawal Initialization Error for ${userId}:`, error.message);
-            throw error;
-        }
-    }
-
-    async invalidateWalletCache(userId) {
-        try {
-            const keys = [`wallet:cache:${userId}`, `wallet:balance:${userId}`];
-            await Promise.all(keys.map(key => client.del(key)));
-        } catch (error) {
-            console.warn('⚠️  Cache invalidation error:', error);
-        }
-    }
-
-    async initializeWithdrawal(userId, userEmail, userName, payload) {
-        const { amountKobo, accountNumber, bankCode, accountName } = payload;
-        const amountNaira = amountKobo / 100;
-        const reference = `wd_${Date.now()}_${userId.slice(0, 5)}`;
-        const lockKey = `withdraw:lock:${reference}`;
-
-        try {
-            await this._verifyWalletStatus(userId);
-
-            const result = await db.runTransaction(async (transaction) => {
-                const walletRef = db.collection('wallets').doc(userId);
-                const userRef   = db.collection('users').doc(userId);
-                const txnRef    = db.collection('transactions').doc(`txn_${reference}`);
-
-                const [walletSnap, userSnap] = await Promise.all([
-                    transaction.get(walletRef),
-                    transaction.get(userRef)
-                ]);
-
-                if (!walletSnap.exists) throw new Error('Wallet not found');
-                const wallet = walletSnap.data();
-
-                if (wallet.balance < amountNaira) throw new Error('Insufficient balance');
-
-                const userData = userSnap.data();
-                if (!userData.paystackRecipientCode) {
-                    throw new Error('Bank recipient not found. Please link your bank account again.');
-                }
-
-                transaction.set(txnRef, {
-                    id: reference,
-                    userId,
-                    type: 'debit',
-                    amount: amountNaira,
-                    description: `Withdrawal to ${accountName} (${bankCode})`,
-                    status: 'processing',
-                    timestamp: Date.now(),
-                    metadata: { withdrawal: true, accountNumber, bankCode, accountName, reference }
-                });
-
-                transaction.update(walletRef, {
-                    balance: admin.firestore.FieldValue.increment(-amountNaira),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
-                });
-
-                return { recipientCode: userData.paystackRecipientCode };
-            });
-
-            const transfer = await paystackService.initiateTransfer(
-                result.recipientCode,
-                amountNaira,
-                `EliteHub Payout: ${reference}`
-            );
-
-            await client.setEx(lockKey, 86400, 'true');
-            await this.invalidateWalletCache(userId);
-
-            try {
-                await emailService.sendWithdrawalConfirmation(userEmail, userName, amountNaira, {
-                    accountName,
-                    bankName: 'Verified Bank',
-                    accountNumber
-                });
-            } catch (err) {
-                console.warn('📧 Notification failed but withdrawal succeeded:', err.message);
-            }
-
-            return { success: true, reference: transfer.reference, amount: amountNaira };
-
-        } catch (error) {
-            console.error(`❌ Withdrawal Initialization Error for ${userId}:`, error.message);
-            throw error;
-        }
-    }
-
     async processOrderPayment(buyerId, sellerId, orderId, totalAmount, commission) {
         const lockKey = `order:payment:${orderId}`;
         try {
@@ -332,7 +195,7 @@ class WalletService {
 
             await Promise.all([this.ensureWalletExists(buyerId), this.ensureWalletExists(sellerId)]);
 
-            const buyerRef = db.collection('wallets').doc(buyerId);
+            const buyerRef  = db.collection('wallets').doc(buyerId);
             const sellerRef = db.collection('wallets').doc(sellerId);
 
             await db.runTransaction(async (transaction) => {
@@ -357,7 +220,7 @@ class WalletService {
                     updatedAt: admin.firestore.FieldValue.serverTimestamp()
                 });
 
-                const sellerTxnId = `order_${orderId}`;
+                const sellerTxnId  = `order_${orderId}`;
                 const sellerTxnRef = sellerRef.collection('transactions').doc(sellerTxnId);
                 transaction.set(sellerTxnRef, {
                     id: sellerTxnId, userId: sellerId, type: 'credit', category: 'order_payment',
@@ -381,60 +244,85 @@ class WalletService {
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────────
+    // ✅ CRITICAL FIX: releaseEscrow now credits admin wallet with commission.
+    //
+    // Previous behaviour: commission was deducted from seller payout but
+    // never credited anywhere → admin wallet always showed ₦0, earnings
+    // dashboard showed nothing.
+    //
+    // New behaviour:
+    //   1. Seller receives  totalAmount − commission
+    //   2. Admin wallet receives commission (5% of totalAmount)
+    //   3. Both happen in the same Firestore transaction → atomic, no drift
+    // ─────────────────────────────────────────────────────────────────────────────
     async releaseEscrow(orderId, buyerId, sellerId, totalAmount, commission) {
-        const lockKey = `release:lock:${orderId}`;
+        const lockKey     = `release:lock:${orderId}`;
         const sellerAmount = totalAmount - commission;
+
         try {
             const isProcessed = await client.get(lockKey);
             if (isProcessed) return { success: true, alreadyProcessed: true };
             await client.setEx(lockKey, 86400, 'true');
 
-            const sellerRef = db.collection('wallets').doc(sellerId);
-            const buyerRef = db.collection('wallets').doc(buyerId);
-            const orderRef = db.collection('orders').doc(orderId);
+            const sellerRef           = db.collection('wallets').doc(sellerId);
+            const buyerRef            = db.collection('wallets').doc(buyerId);
+            const adminRef            = db.collection('wallets').doc('admin');   // ✅ admin wallet
+            const orderRef            = db.collection('orders').doc(orderId);
             const buyerOriginalTxnRef = buyerRef.collection('transactions').doc(`pay_${orderId}`);
-            const sellerTxnRef = sellerRef.collection('transactions').doc(`order_${orderId}`);
+            const sellerTxnRef        = sellerRef.collection('transactions').doc(`order_${orderId}`);
+            const adminCommTxnRef     = adminRef.collection('transactions').doc(`commission_${orderId}`); // ✅
 
             const result = await db.runTransaction(async (transaction) => {
-                const [orderDoc, sellerDoc, buyerDoc, buyerTxnSnap, sellerTxnSnap] = await Promise.all([
+                // ── PHASE 1: READS ────────────────────────────────────────────
+                const [
+                    orderDoc, sellerDoc, buyerDoc, adminDoc,
+                    buyerTxnSnap, sellerTxnSnap, adminCommSnap
+                ] = await Promise.all([
                     transaction.get(orderRef),
                     transaction.get(sellerRef),
                     transaction.get(buyerRef),
+                    transaction.get(adminRef),        // ✅
                     transaction.get(buyerOriginalTxnRef),
-                    transaction.get(sellerTxnRef)
+                    transaction.get(sellerTxnRef),
+                    transaction.get(adminCommTxnRef)  // ✅ idempotency check
                 ]);
 
                 if (!orderDoc.exists) throw new Error("Order not found");
                 const orderData = orderDoc.data();
                 if (orderData.status === 'delivered') return { success: true, alreadyProcessed: true };
-                if (orderData.status !== 'running') throw new Error(`Invalid order status: ${orderData.status}`);
+                if (orderData.status !== 'running')   throw new Error(`Invalid order status: ${orderData.status}`);
                 if (!sellerDoc.exists || !buyerDoc.exists) throw new Error("Wallet not found");
 
+                // ── PHASE 2: WRITES ───────────────────────────────────────────
+
+                // 1. Mark order delivered
                 transaction.update(orderRef, {
                     status: 'delivered', buyerConfirmed: true,
-                    deliveredAt: admin.firestore.FieldValue.serverTimestamp(),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                    deliveredAt:  admin.firestore.FieldValue.serverTimestamp(),
+                    updatedAt:    admin.firestore.FieldValue.serverTimestamp()
                 });
 
+                // 2. Update buyer's escrow transaction → completed
                 if (buyerTxnSnap.exists) {
                     transaction.update(buyerOriginalTxnRef, {
                         status: 'completed',
                         description: `Order #${orderId.slice(-6).toUpperCase()} - Completed`,
                         completedAt: Date.now(),
-                        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                        updatedAt:   admin.firestore.FieldValue.serverTimestamp()
                     });
                 }
 
+                // 3. Update / create seller payout transaction
                 if (sellerTxnSnap.exists) {
                     transaction.update(sellerTxnRef, {
-                        status: 'completed',
-                        category: 'order_release',
+                        status:      'completed',
+                        category:    'order_release',
                         description: `Order #${orderId.slice(-6).toUpperCase()} - Payment Released`,
                         completedAt: Date.now(),
-                        updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                        updatedAt:   admin.firestore.FieldValue.serverTimestamp()
                     });
                 } else {
-                    console.warn(`⚠️ Seller transaction not found for order ${orderId}, creating fallback`);
                     transaction.set(sellerTxnRef, {
                         id: `order_${orderId}`, userId: sellerId, type: 'credit',
                         category: 'order_release', amount: sellerAmount,
@@ -445,14 +333,54 @@ class WalletService {
                     });
                 }
 
+                // 4. ✅ Credit admin wallet with commission (idempotent)
+                if (!adminCommSnap.exists) {
+                    transaction.set(adminCommTxnRef, {
+                        id:          `commission_${orderId}`,
+                        userId:      'admin',
+                        type:        'credit',
+                        category:    'commission',
+                        amount:      commission,
+                        description: `5% Commission: Order #${orderId.slice(-6).toUpperCase()}`,
+                        timestamp:   Date.now(),
+                        status:      'completed',
+                        metadata: {
+                            orderId,
+                            totalOrderAmount: totalAmount,
+                            commissionRate:   PLATFORM_COMMISSION_RATE,
+                            sellerId,
+                            buyerId
+                        }
+                    });
+
+                    // Ensure admin wallet doc exists, then increment
+                    if (!adminDoc.exists) {
+                        transaction.set(adminRef, {
+                            userId: 'admin', balance: commission,
+                            pendingBalance: 0, isLocked: false, currency: 'NGN',
+                            createdAt: admin.firestore.FieldValue.serverTimestamp(),
+                            updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+                            version: 1
+                        });
+                    } else {
+                        transaction.update(adminRef, {
+                            balance:   admin.firestore.FieldValue.increment(commission),
+                            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                        });
+                    }
+                }
+
+                // 5. Release seller balance
                 transaction.update(sellerRef, {
-                    balance: admin.firestore.FieldValue.increment(sellerAmount),
+                    balance:        admin.firestore.FieldValue.increment(sellerAmount),
                     pendingBalance: admin.firestore.FieldValue.increment(-sellerAmount),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                    updatedAt:      admin.firestore.FieldValue.serverTimestamp()
                 });
+
+                // 6. Clear buyer pending
                 transaction.update(buyerRef, {
                     pendingBalance: admin.firestore.FieldValue.increment(-totalAmount),
-                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                    updatedAt:      admin.firestore.FieldValue.serverTimestamp()
                 });
 
                 return { success: true, alreadyProcessed: false, amount: sellerAmount };
@@ -460,10 +388,11 @@ class WalletService {
 
             await this.invalidateWalletCache(sellerId);
             await this.invalidateWalletCache(buyerId);
+            await this.invalidateWalletCache('admin'); // ✅ bust admin balance cache
 
             await Promise.allSettled([
                 pushNotificationService.sendPushToUser(buyerId, "Order Completed! 🛍️",
-                    `Your order #${orderId.slice(-6).toUpperCase()} has been finalized.`, { screen: "OrdersTab" }),
+                    `Your order #${orderId.slice(-6).toUpperCase()} has been finalised.`, { screen: "OrdersTab" }),
                 pushNotificationService.sendPushToUser(sellerId, "💸 Payment Released",
                     `₦${sellerAmount.toLocaleString()} has been added to your balance.`, { screen: "OrdersTab" })
             ]);
@@ -476,14 +405,12 @@ class WalletService {
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // ✅ FIX: refundEscrow — three bugs fixed:
-    //   1. Added `category: 'order_release'` to seller update (was missing → subtitle stuck at 'Pending delivery confirmation')
-    //   2. Added SET fallback when sellerTxnSnap doesn't exist (was silently skipped → no update at all)
-    //   3. Added `category: 'order_release'` to the fallback SET as well
-    // ─────────────────────────────────────────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────────────────────
+    // refundEscrow — unchanged logic but commission is NOT credited to admin
+    // (no sale completed = no platform fee earned)
+    // ─────────────────────────────────────────────────────────────────────────────
     async refundEscrow(orderId, buyerId, sellerId, totalAmount, commission, reason) {
-        const lockKey = `refund:lock:${orderId}`;
+        const lockKey      = `refund:lock:${orderId}`;
         const sellerAmount = totalAmount - commission;
 
         try {
@@ -499,7 +426,6 @@ class WalletService {
                 const buyerOriginalTxnRef = buyerRef.collection('transactions').doc(`pay_${orderId}`);
                 const sellerTxnRef        = sellerRef.collection('transactions').doc(`order_${orderId}`);
 
-                // ── PHASE 1: ALL READS FIRST ──────────────────────────────
                 const [orderDoc, originalSnap, sellerTxnSnap] = await Promise.all([
                     transaction.get(orderRef),
                     transaction.get(buyerOriginalTxnRef),
@@ -509,22 +435,16 @@ class WalletService {
                 if (!orderDoc.exists) throw new Error("Order not found");
                 const orderStatus = orderDoc.data().status;
                 if (orderStatus === 'delivered') throw new Error("Cannot refund delivered orders");
-                // Allow cancellation from 'running' or already 'cancelled' (idempotent retry)
                 if (orderStatus !== 'running' && orderStatus !== 'cancelled') {
                     throw new Error(`Invalid order status for refund: ${orderStatus}`);
                 }
 
-                // ── PHASE 2: ALL WRITES AFTER ─────────────────────────────
-
-                // 1. Update order status
                 transaction.update(orderRef, {
-                    status: 'cancelled',
-                    cancelReason: reason,
+                    status: 'cancelled', cancelReason: reason,
                     cancelledAt: admin.firestore.FieldValue.serverTimestamp(),
                     updatedAt:   admin.firestore.FieldValue.serverTimestamp()
                 });
 
-                // 2. Update buyer's original escrow transaction → refunded
                 if (originalSnap.exists) {
                     transaction.update(buyerOriginalTxnRef, {
                         status:      'refunded',
@@ -533,52 +453,34 @@ class WalletService {
                     });
                 }
 
-                // 3. Create refund credit for buyer
                 const refundTxnId  = `refund_${orderId}`;
                 const refundTxnRef = buyerRef.collection('transactions').doc(refundTxnId);
                 transaction.set(refundTxnRef, {
-                    id:          refundTxnId,
-                    userId:      buyerId,
-                    type:        'credit',
-                    category:    'order_refund',
-                    amount:      totalAmount,
+                    id: refundTxnId, userId: buyerId, type: 'credit',
+                    category: 'order_refund', amount: totalAmount,
                     description: `Refund: Order #${orderId.slice(-6).toUpperCase()}`,
-                    timestamp:   Date.now(),
-                    status:      'completed',
-                    metadata:    { orderId, reason, refundType: 'order_cancellation', reference: refundTxnId }
+                    timestamp: Date.now(), status: 'completed',
+                    metadata: { orderId, reason, refundType: 'order_cancellation', reference: refundTxnId }
                 });
 
-                // 4. ✅ FIX: Update seller's transaction with BOTH status AND category
-                //    Previously only `status: 'cancelled'` was written → category stayed
-                //    'order_payment' → subtitle stayed 'Pending delivery confirmation'.
-                //    Now we flip category to 'order_release' so the card renders correctly,
-                //    and we add a SET fallback for the case where the doc doesn't exist yet
-                //    (was silently skipped before → no update at all).
                 if (sellerTxnSnap.exists) {
                     transaction.update(sellerTxnRef, {
                         status:      'cancelled',
-                        category:    'order_release',   // ← THE FIX
+                        category:    'order_release',
                         description: `Order #${orderId.slice(-6).toUpperCase()} - Cancelled`,
                         updatedAt:   admin.firestore.FieldValue.serverTimestamp()
                     });
                 } else {
-                    // ✅ FIX: Was silently doing nothing — now creates the doc instead
-                    console.warn(`⚠️ Seller txn not found for order ${orderId} during refund, creating fallback`);
                     transaction.set(sellerTxnRef, {
-                        id:          `order_${orderId}`,
-                        userId:      sellerId,
-                        type:        'credit',
-                        category:    'order_release',   // ← THE FIX (fallback too)
-                        amount:      sellerAmount,
+                        id: `order_${orderId}`, userId: sellerId, type: 'credit',
+                        category: 'order_release', amount: sellerAmount,
                         description: `Order #${orderId.slice(-6).toUpperCase()} - Cancelled`,
-                        timestamp:   Date.now(),
-                        status:      'cancelled',
-                        metadata:    { orderId, reason, paymentType: 'order_cancelled',
-                                       reference: `order_${orderId}`, fallbackCreated: true }
+                        timestamp: Date.now(), status: 'cancelled',
+                        metadata: { orderId, reason, paymentType: 'order_cancelled',
+                            reference: `order_${orderId}`, fallbackCreated: true }
                     });
                 }
 
-                // 5. Adjust balances
                 transaction.update(buyerRef, {
                     balance:        admin.firestore.FieldValue.increment(totalAmount),
                     pendingBalance: admin.firestore.FieldValue.increment(-totalAmount),
@@ -600,9 +502,7 @@ class WalletService {
                     { screen: "OrdersTab" })
             ]);
 
-            console.log(`✅ Refund processed for order ${orderId}`);
             return { success: true, alreadyProcessed: false };
-
         } catch (error) {
             console.error(`❌ Refund escrow error for ${orderId}:`, error);
             if (!error.message?.includes('delivered')) await client.del(lockKey);
@@ -610,18 +510,18 @@ class WalletService {
         }
     }
 
+    // ─── Atomic helpers for dispute resolution (called inside existing transactions) ─
+
     async releaseEscrowAtomic(transaction, order) {
-        const sellerRef   = db.collection('wallets').doc(order.sellerId);
-        const buyerRef    = db.collection('wallets').doc(order.buyerId);
+        const sellerRef    = db.collection('wallets').doc(order.sellerId);
+        const buyerRef     = db.collection('wallets').doc(order.buyerId);
+        const adminRef     = db.collection('wallets').doc('admin');           // ✅
         const sellerAmount = order.totalAmount - order.commission;
 
+        // Seller
         transaction.update(sellerRef, {
             balance:        admin.firestore.FieldValue.increment(sellerAmount),
             pendingBalance: admin.firestore.FieldValue.increment(-sellerAmount),
-            updatedAt:      admin.firestore.FieldValue.serverTimestamp()
-        });
-        transaction.update(buyerRef, {
-            pendingBalance: admin.firestore.FieldValue.increment(-order.totalAmount),
             updatedAt:      admin.firestore.FieldValue.serverTimestamp()
         });
         const sellerTxnRef = sellerRef.collection('transactions').doc(`order_${order.id}`);
@@ -632,6 +532,26 @@ class WalletService {
             status: 'completed', timestamp: Date.now(),
             metadata: { orderId: order.id, resolution: 'release' }
         }, { merge: true });
+
+        // Buyer pending cleared
+        transaction.update(buyerRef, {
+            pendingBalance: admin.firestore.FieldValue.increment(-order.totalAmount),
+            updatedAt:      admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        // ✅ Admin commission on dispute release
+        const adminCommTxnRef = adminRef.collection('transactions').doc(`commission_${order.id}`);
+        transaction.set(adminCommTxnRef, {
+            id: `commission_${order.id}`, userId: 'admin', type: 'credit',
+            category: 'commission', amount: order.commission,
+            description: `5% Commission (Dispute Release): Order #${order.id.slice(-6).toUpperCase()}`,
+            timestamp: Date.now(), status: 'completed',
+            metadata: { orderId: order.id, resolution: 'release', commissionRate: PLATFORM_COMMISSION_RATE }
+        }, { merge: true });
+        transaction.update(adminRef, {
+            balance:   admin.firestore.FieldValue.increment(order.commission),
+            updatedAt: admin.firestore.FieldValue.serverTimestamp()
+        });
     }
 
     async refundEscrowAtomic(transaction, order, reason) {
@@ -657,6 +577,80 @@ class WalletService {
             status: 'completed', timestamp: Date.now(),
             metadata: { orderId: order.id, reason }
         });
+        // No admin commission on refund — buyer gets 100% back
+    }
+
+    async initializeWithdrawal(userId, userEmail, userName, payload) {
+        const { amountKobo, accountNumber, bankCode, accountName } = payload;
+        const amountNaira = amountKobo / 100;
+        const reference   = `wd_${Date.now()}_${userId.slice(0, 5)}`;
+        const lockKey     = `withdraw:lock:${reference}`;
+
+        try {
+            await this._verifyWalletStatus(userId);
+
+            const result = await db.runTransaction(async (transaction) => {
+                const walletRef = db.collection('wallets').doc(userId);
+                const userRef   = db.collection('users').doc(userId);
+                const txnRef    = db.collection('transactions').doc(`txn_${reference}`);
+
+                const [walletSnap, userSnap] = await Promise.all([
+                    transaction.get(walletRef),
+                    transaction.get(userRef)
+                ]);
+
+                if (!walletSnap.exists) throw new Error('Wallet not found');
+                const wallet = walletSnap.data();
+                if (wallet.balance < amountNaira) throw new Error('Insufficient balance');
+
+                const userData = userSnap.data();
+                if (!userData.paystackRecipientCode) {
+                    throw new Error('Bank recipient not found. Please link your bank account again.');
+                }
+
+                transaction.set(txnRef, {
+                    id: reference, userId, type: 'debit', amount: amountNaira,
+                    description: `Withdrawal to ${accountName} (${bankCode})`,
+                    status: 'processing', timestamp: Date.now(),
+                    metadata: { withdrawal: true, accountNumber, bankCode, accountName, reference }
+                });
+                transaction.update(walletRef, {
+                    balance:   admin.firestore.FieldValue.increment(-amountNaira),
+                    updatedAt: admin.firestore.FieldValue.serverTimestamp()
+                });
+
+                return { recipientCode: userData.paystackRecipientCode };
+            });
+
+            const transfer = await paystackService.initiateTransfer(
+                result.recipientCode, amountNaira, `EliteHub Payout: ${reference}`
+            );
+
+            await client.setEx(lockKey, 86400, 'true');
+            await this.invalidateWalletCache(userId);
+
+            try {
+                await emailService.sendWithdrawalConfirmation(userEmail, userName, amountNaira, {
+                    accountName, bankName: 'Verified Bank', accountNumber
+                });
+            } catch (err) {
+                console.warn('📧 Notification failed but withdrawal succeeded:', err.message);
+            }
+
+            return { success: true, reference: transfer.reference, amount: amountNaira };
+        } catch (error) {
+            console.error(`❌ Withdrawal Initialization Error for ${userId}:`, error.message);
+            throw error;
+        }
+    }
+
+    async invalidateWalletCache(userId) {
+        try {
+            const keys = [`wallet:cache:${userId}`, `wallet:balance:${userId}`];
+            await Promise.all(keys.map(key => client.del(key)));
+        } catch (error) {
+            console.warn('⚠️  Cache invalidation error:', error);
+        }
     }
 }
 
